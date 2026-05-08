@@ -432,7 +432,8 @@ class PCRCache:
                     if c.get("market_data"): ce += c["market_data"].get("oi", 0)
                 if ce > 0 and (pe + ce) > 1000:
                     pcr  = round(pe / ce, 2)
-                    bias = "bullish" if pcr > 1.2 else "bearish" if pcr < 0.8 else "neutral"
+                    # Tightened: >1.1 bullish, <0.9 bearish (was 1.2/0.8)
+                    bias = "bullish" if pcr > 1.1 else "bearish" if pcr < 0.9 else "neutral"
                     self.val  = pcr; self.bias = bias
                     self.time = datetime.datetime.now()
                     log.info(f"PCR:{pcr}({bias}) expiry:{expiry_str} PE:{pe} CE:{ce}")

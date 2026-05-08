@@ -112,7 +112,8 @@ def get_pcr_bias(analytics_token):
 
             if ce_oi > 0 and (pe_oi + ce_oi) > 1000:
                 pcr  = round(pe_oi / ce_oi, 2)
-                bias = "bullish" if pcr > 1.2 else "bearish" if pcr < 0.8 else "neutral"
+                # Tightened: >1.1 bullish, <0.9 bearish (was 1.2/0.8)
+                bias = "bullish" if pcr > 1.1 else "bearish" if pcr < 0.9 else "neutral"
                 log.info(f"PCR: {pcr} → {bias} (expiry:{expiry_str} PE:{pe_oi} CE:{ce_oi})")
                 return bias, pcr
             else:
@@ -208,34 +209,83 @@ def get_gift_nifty_bias(analytics_token, prev_close):
 
 
 def get_moneycontrol_news_bias():
-    """Moneycontrol market news sentiment for Nifty."""
-    try:
-        resp  = requests.get(
-            "https://www.moneycontrol.com/news/business/markets/",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10
-        )
-        soup  = BeautifulSoup(resp.text, "html.parser")
-        heads = []
-        for tag in soup.find_all(["h2","h3"], limit=30):
-            text = tag.get_text(strip=True)
-            if len(text) > 30:
-                tl = text.lower()
-                if any(w in tl for w in ["nifty","sensex","market","rally",
-                                          "fall","stock","trade","index","fii"]):
-                    heads.append(text[:120])
-        heads = list(dict.fromkeys(heads))[:8]
-        bull  = ["rally","surge","gain","rise","bullish","positive","strong",
-                 "up","buy","support","recovery","boost","high","record"]
-        bear  = ["fall","drop","decline","bearish","negative","weak","down",
-                 "sell","crash","pressure","drag","concern","caution"]
-        score = sum(1 for h in heads for w in bull if w in h.lower()) - \
-                sum(1 for h in heads for w in bear if w in h.lower())
-        sent  = "bullish" if score >= 3 else "bearish" if score <= -3 else "neutral"
-        log.info(f"Moneycontrol news: {sent} | score={score}")
-        return sent, score, heads
-    except Exception as e:
-        log.error(f"Moneycontrol news error: {e}")
-        return "neutral", 0, []
+    """Kept for backwards compatibility — now calls get_multi_source_news_bias."""
+    bias, score, heads = get_multi_source_news_bias()
+    return bias, score, heads
+
+
+def get_multi_source_news_bias():
+    """
+    Multi-source news sentiment for Nifty bias.
+    Scrapes 5 sources: Moneycontrol, Economic Times RSS, Business Standard RSS,
+    Reuters RSS, Yahoo Finance RSS.
+    Returns: (bias, normalised_score, headlines)
+
+    Scoring: each bullish keyword = +1, bearish = -1.
+    Normalised to [-1, +1] then thresholded at ±0.3.
+    """
+    import xml.etree.ElementTree as ET
+
+    BULL = ["rally","surge","gain","rise","bullish","positive","strong","buy",
+            "support","recovery","boost","record high","breakout","outperform",
+            "upgrade","beat","profit jumps","order win","fii buying","upside"]
+    BEAR = ["fall","drop","decline","bearish","negative","weak","sell","crash",
+            "pressure","drag","concern","caution","downgrade","miss","sebi notice",
+            "margin pressure","fii selling","recession","rate hike","slump"]
+    MARKET_KW = ["nifty","sensex","market","rally","fall","stock","trade",
+                 "index","fii","rbi","fed","rupee","crude","inflation","rate"]
+
+    sources = [
+        ("https://www.moneycontrol.com/news/business/markets/",                             "html"),
+        ("https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms",  "rss"),
+        ("https://www.business-standard.com/rss/markets-106.rss",                          "rss"),
+        ("https://feeds.reuters.com/reuters/businessNews",                                  "rss"),
+        ("https://finance.yahoo.com/news/rssindex",                                         "rss"),
+    ]
+
+    all_heads = []
+    for url, src_type in sources:
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if resp.status_code != 200:
+                continue
+            if src_type == "html":
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for tag in soup.find_all(["h2","h3"], limit=30):
+                    t = tag.get_text(strip=True)
+                    if len(t) > 25:
+                        all_heads.append(t[:120])
+            else:
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item")[:20]:
+                    title = item.findtext("title","").strip()
+                    if title:
+                        all_heads.append(title[:120])
+        except Exception as e:
+            log.debug(f"News source {url[:45]}: {e}")
+
+    # Deduplicate
+    seen = set(); dedup = []
+    for h in all_heads:
+        k = h[:50].lower()
+        if k not in seen:
+            seen.add(k); dedup.append(h)
+
+    # Filter to market-relevant headlines
+    relevant = [h for h in dedup
+                if any(w in h.lower() for w in MARKET_KW)][:15]
+
+    bull_score = sum(1 for h in relevant for w in BULL if w in h.lower())
+    bear_score = sum(1 for h in relevant for w in BEAR if w in h.lower())
+    raw        = bull_score - bear_score
+
+    # Normalise to [-1, +1], clamp at ±5
+    norm = max(-1.0, min(1.0, raw / 5.0))
+    bias = "bullish" if norm >= 0.3 else "bearish" if norm <= -0.3 else "neutral"
+
+    log.info(f"Multi-source news: {bias} raw={raw} norm={norm:.2f} "
+             f"total={len(dedup)} relevant={len(relevant)}")
+    return bias, round(norm, 3), relevant[:5]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -573,43 +623,57 @@ def get_combined_bias_nifty(analytics_token, prev_close, user_bias="neutral"):
     """
     Combine all Nifty bias sources.
     Called once at pre-market (9:00 AM IST).
+
+    WEIGHTS (sum = 1.0):
+      FII/DII manual   : 35%  — your read of institutional flow
+      PCR (Upstox)     : 25%  — most reliable intraday options signal
+      Multi-source news: 20%  — 5 sources: MC, ET, BS, Reuters, Yahoo
+      India VIX        : 10%  — fear/greed gauge
+      GIFT Nifty       : 10%  — pre-market global signal
+
+    news_norm is already on [-1,+1] scale so used directly (not via score_map).
+    All others are discrete: bullish=+1, neutral=0, bearish=-1.
     """
     score_map = {"bullish": 1, "neutral": 0, "bearish": -1}
 
-    pcr_bias,   pcr_val             = get_pcr_bias(analytics_token)
-    vix_bias,   vix_val             = get_india_vix_bias(analytics_token)
-    gift_bias,  gift_chg, gift_price = get_gift_nifty_bias(analytics_token, prev_close)
-    news_bias,  news_score, heads    = get_moneycontrol_news_bias()
+    pcr_bias,  pcr_val              = get_pcr_bias(analytics_token)
+    vix_bias,  vix_val              = get_india_vix_bias(analytics_token)
+    gift_bias, gift_chg, gift_price = get_gift_nifty_bias(analytics_token, prev_close)
+    news_bias, news_norm, heads     = get_multi_source_news_bias()
 
     score = (
-        score_map.get(user_bias,  0) * 0.40 +   # FII/DII manual (highest)
-        score_map.get(pcr_bias,   0) * 0.25 +   # PCR from Upstox
-        score_map.get(news_bias,  0) * 0.15 +   # Moneycontrol news
-        score_map.get(vix_bias,   0) * 0.10 +   # India VIX
-        score_map.get(gift_bias,  0) * 0.10     # GIFT Nifty
+        score_map.get(user_bias, 0) * 0.35 +   # FII/DII manual
+        score_map.get(pcr_bias,  0) * 0.25 +   # PCR live from Upstox
+        news_norm                   * 0.20 +   # multi-source normalised [-1,+1]
+        score_map.get(vix_bias,  0) * 0.10 +   # India VIX
+        score_map.get(gift_bias, 0) * 0.10     # GIFT Nifty / live Nifty
     )
 
-    final_bias = "bullish" if score >= 0.25 else "bearish" if score <= -0.25 else "neutral"
-    conf       = "HIGH" if abs(score) > 0.5 else "MEDIUM" if abs(score) > 0.25 else "LOW"
+    # ±0.20 threshold: at least 2 sources must agree for a directional call
+    final_bias = "bullish" if score >= 0.20 else "bearish" if score <= -0.20 else "neutral"
+    conf       = "HIGH"   if abs(score) > 0.45 else \
+                 "MEDIUM" if abs(score) > 0.20 else "LOW"
 
     report = {
-        "final_bias" : final_bias,
-        "confidence" : conf,
-        "score"      : round(score, 3),
-        "user_bias"  : user_bias,
-        "pcr_bias"   : pcr_bias,
-        "pcr_val"    : pcr_val,
-        "vix_bias"   : vix_bias,
-        "vix_val"    : vix_val,
-        "gift_bias"  : gift_bias,
-        "gift_chg"   : gift_chg,
-        "gift_price" : gift_price,
-        "news_bias"  : news_bias,
-        "news_score" : news_score,
-        "headlines"  : heads,
+        "final_bias"  : final_bias,
+        "confidence"  : conf,
+        "score"       : round(score, 3),
+        "user_bias"   : user_bias,
+        "pcr_bias"    : pcr_bias,
+        "pcr_val"     : pcr_val,
+        "vix_bias"    : vix_bias,
+        "vix_val"     : vix_val,
+        "gift_bias"   : gift_bias,
+        "gift_chg"    : gift_chg,
+        "gift_price"  : gift_price,
+        "news_bias"   : news_bias,
+        "news_score"  : news_norm,
+        "headlines"   : heads,
     }
 
-    log.info(f"Nifty combined bias: {final_bias} ({conf}) score={score:.3f}")
+    log.info(f"Nifty combined bias: {final_bias} ({conf}) score={score:.3f} "
+             f"[FII:{user_bias} PCR:{pcr_bias} news:{news_bias} "
+             f"VIX:{vix_bias} GIFT:{gift_bias}]")
     return final_bias, report
 
 
@@ -655,11 +719,11 @@ def format_bias_message_nifty(report):
         f"  Combined score   : {score:+.3f}",
         f"",
         f"  <b>Sources (weighted):</b>",
-        f"  FII/DII /bias    : {report['user_bias'].upper()} (40%)",
+        f"  FII/DII /bias    : {report['user_bias'].upper()} (35%)",
         f"  PCR              : {report['pcr_bias'].upper()} "
         f"({report['pcr_val'] or 'N/A'}) (25%)",
-        f"  Moneycontrol news: {report['news_bias'].upper()} "
-        f"(score={report['news_score']}) (15%)",
+        f"  News (5 sources) : {report['news_bias'].upper()} "
+        f"(norm={report['news_score']:+.2f}) (20%)",
         f"  India VIX        : {report['vix_bias'].upper()} "
         f"(VIX={report['vix_val']:.1f}) (10%)",
         f"  GIFT Nifty       : {report['gift_bias'].upper()} "
