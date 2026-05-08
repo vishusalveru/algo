@@ -222,16 +222,29 @@ def get_multi_source_news_bias():
     Returns: (bias, normalised_score, headlines)
 
     Scoring: each bullish keyword = +1, bearish = -1.
-    Normalised to [-1, +1] then thresholded at ±0.3.
+    Context negation: "rises from low", "recovers from fall" = bearish context.
+    Normalised to [-1, +1] thresholded at ±0.4 (tighter than before).
     """
     import xml.etree.ElementTree as ET
 
-    BULL = ["rally","surge","gain","rise","bullish","positive","strong","buy",
-            "support","recovery","boost","record high","breakout","outperform",
-            "upgrade","beat","profit jumps","order win","fii buying","upside"]
+    # Removed weak words: "rise","gain","support","recovery","boost","buy","strong"
+    # These fire on bounce-from-fall headlines and give false bullish signal
+    BULL = ["rally","surge","bullish","record high","breakout","outperform",
+            "upgrade","beat","profit jumps","order win","fii buying","upside",
+            "all-time high","52-week high","strong buy","target raised"]
     BEAR = ["fall","drop","decline","bearish","negative","weak","sell","crash",
             "pressure","drag","concern","caution","downgrade","miss","sebi notice",
-            "margin pressure","fii selling","recession","rate hike","slump"]
+            "margin pressure","fii selling","recession","rate hike","slump",
+            "plunge","tumble","selloff","sell-off","cut target","warns","fear"]
+
+    # Negation patterns — headlines with these phrases are bearish CONTEXT
+    # even if they contain bullish words like "rises" or "recovery"
+    NEGATION_PHRASES = [
+        "rises from", "recovers from", "bounces from", "up from low",
+        "from day's low", "from week's low", "despite", "even as market falls",
+        "after fall", "after sharp decline", "limited recovery"
+    ]
+
     MARKET_KW = ["nifty","sensex","market","rally","fall","stock","trade",
                  "index","fii","rbi","fed","rupee","crude","inflation","rate"]
 
@@ -275,16 +288,32 @@ def get_multi_source_news_bias():
     relevant = [h for h in dedup
                 if any(w in h.lower() for w in MARKET_KW)][:15]
 
-    bull_score = sum(1 for h in relevant for w in BULL if w in h.lower())
-    bear_score = sum(1 for h in relevant for w in BEAR if w in h.lower())
-    raw        = bull_score - bear_score
+    bull_score = 0
+    bear_score = 0
+    for h in relevant:
+        hl = h.lower()
+        # Check negation context first — if present, flip bull hits to neutral
+        has_negation = any(neg in hl for neg in NEGATION_PHRASES)
+        for w in BULL:
+            if w in hl:
+                if has_negation:
+                    pass   # don't count bullish word if negation context
+                else:
+                    bull_score += 1
+        for w in BEAR:
+            if w in hl:
+                bear_score += 1
+        # Negation phrase itself counts as mild bear signal
+        if has_negation:
+            bear_score += 1
 
-    # Normalise to [-1, +1], clamp at ±5
-    norm = max(-1.0, min(1.0, raw / 5.0))
-    bias = "bullish" if norm >= 0.3 else "bearish" if norm <= -0.3 else "neutral"
+    raw  = bull_score - bear_score
+    # Tighter normalisation: clamp at ±4 (was ±5), threshold at ±0.4 (was ±0.3)
+    norm = max(-1.0, min(1.0, raw / 4.0))
+    bias = "bullish" if norm >= 0.4 else "bearish" if norm <= -0.4 else "neutral"
 
-    log.info(f"Multi-source news: {bias} raw={raw} norm={norm:.2f} "
-             f"total={len(dedup)} relevant={len(relevant)}")
+    log.info(f"Multi-source news: {bias} raw={raw}(B+{bull_score}/bear-{bear_score}) "
+             f"norm={norm:.2f} relevant={len(relevant)}")
     return bias, round(norm, 3), relevant[:5]
 
 
