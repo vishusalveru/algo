@@ -162,32 +162,49 @@ def get_gift_nifty_bias(analytics_token, prev_close):
     """
     GIFT Nifty (SGX Nifty equivalent) pre-market direction.
     Compares GIFT Nifty to previous Nifty close.
-    > +0.3% → bullish
-    < -0.3% → bearish
+    > +0.3% → bullish  |  < -0.3% → bearish
+    Tries multiple instrument keys in case the primary one changes.
     """
+    gift_keys = [
+        "NSE_INDEX|GIFT Nifty",
+        "NSE_INDEX|Nifty 50",   # fallback: use live Nifty itself after hours
+    ]
     try:
         headers = {
             "Accept"       : "application/json",
             "Authorization": f"Bearer {analytics_token}"
         }
-        resp = requests.get(
-            "https://api.upstox.com/v2/market-quote/ltp",
-            headers=headers,
-            params={"instrument_key": "NSE_INDEX|GIFT Nifty"},
-            timeout=5
-        )
-        data = resp.json()
-        if data["status"] == "success" and prev_close:
-            key       = list(data["data"].keys())[0]
-            gift_price = float(data["data"][key]["last_price"])
-            chg_pct   = ((gift_price - prev_close) / prev_close) * 100
-            bias      = "bullish" if chg_pct > 0.3 else "bearish" if chg_pct < -0.3 else "neutral"
-            log.info(f"GIFT Nifty: {gift_price:.2f} | {chg_pct:+.2f}% → {bias}")
+        for instrument_key in gift_keys:
+            resp = requests.get(
+                "https://api.upstox.com/v2/market-quote/ltp",
+                headers=headers,
+                params={"instrument_key": instrument_key},
+                timeout=5
+            )
+            data = resp.json()
+            if data.get("status") != "success":
+                continue
+            keys = list((data.get("data") or {}).keys())
+            if not keys:
+                log.info(f"GIFT Nifty: no data for {instrument_key}")
+                continue
+            gift_price = float(data["data"][keys[0]]["last_price"])
+            if gift_price <= 0:
+                continue
+            if prev_close and prev_close > 0:
+                chg_pct = ((gift_price - prev_close) / prev_close) * 100
+                bias    = "bullish" if chg_pct > 0.3 else "bearish" if chg_pct < -0.3 else "neutral"
+            else:
+                chg_pct = 0.0
+                bias    = "neutral"
+            log.info(f"GIFT Nifty ({instrument_key}): {gift_price:.2f} | {chg_pct:+.2f}% → {bias}")
             return bias, round(chg_pct, 2), gift_price
-        return "neutral", 0, 0
+
+        log.warning("GIFT Nifty: all instrument keys failed")
+        return "neutral", 0.0, 0.0
     except Exception as e:
         log.error(f"GIFT Nifty error: {e}")
-        return "neutral", 0, 0
+        return "neutral", 0.0, 0.0
 
 
 def get_moneycontrol_news_bias():
