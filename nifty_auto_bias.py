@@ -37,52 +37,89 @@ log = logging.getLogger(__name__)
 #  SECTION 1: BIAS SOURCES — NIFTY SPECIFIC
 # ═══════════════════════════════════════════════════════════
 
-def get_pcr_bias(analytics_token):
+def get_live_expiries(token, instrument_key="NSE_INDEX|Nifty 50"):
     """
-    PCR from Upstox option chain.
-    > 1.2 → bullish (more puts = protection buying = market confident)
-    < 0.8 → bearish (more calls = speculation = market nervous)
+    Fetch all available expiry dates for an instrument directly from
+    Upstox option contracts endpoint — no date guessing needed.
+    Returns a list of date strings sorted nearest-first, e.g.
+    ['2025-05-12', '2025-05-19', '2025-05-29', ...]
     """
     import datetime
     try:
-        today       = datetime.date.today()
-        days_to_thu = (3 - today.weekday()) % 7
-        if days_to_thu == 0: days_to_thu = 7
-        expiry = today + datetime.timedelta(days=days_to_thu)
-
-        headers = {
-            "Accept"       : "application/json",
-            "Authorization": f"Bearer {analytics_token}"
-        }
+        headers = {"Accept": "application/json",
+                   "Authorization": f"Bearer {token}"}
         resp = requests.get(
-            "https://api.upstox.com/v2/option/chain",
+            "https://api.upstox.com/v2/option/contract",
             headers=headers,
-            params={
-                "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry_date"   : expiry.strftime("%Y-%m-%d")
-            },
+            params={"instrument_key": instrument_key},
             timeout=10
         )
         data = resp.json()
-        if data["status"] != "success" or not data.get("data"):
+        if data.get("status") != "success" or not data.get("data"):
+            log.warning(f"get_live_expiries: bad response {data.get('status')}")
+            return []
+        today = datetime.date.today()
+        expiries = sorted(set(
+            item["expiry"] for item in data["data"]
+            if "expiry" in item and item["expiry"] >= today.strftime("%Y-%m-%d")
+        ))
+        log.info(f"Live expiries fetched: {expiries[:6]}")
+        return expiries
+    except Exception as e:
+        log.error(f"get_live_expiries error: {e}")
+        return []
+
+
+def get_pcr_bias(analytics_token):
+    """
+    PCR from Upstox option chain using LIVE expiry dates.
+    Fetches actual available expiries first — no hardcoded weekday math.
+    > 1.2 → bullish (more puts = protection buying = market confident)
+    < 0.8 → bearish (more calls = speculation = market nervous)
+    """
+    try:
+        headers = {"Accept": "application/json",
+                   "Authorization": f"Bearer {analytics_token}"}
+
+        # Step 1: Get real expiry dates from the market
+        expiries = get_live_expiries(analytics_token)
+        if not expiries:
+            log.warning("PCR: no live expiries available")
             return "neutral", None
 
-        pe_oi = ce_oi = 0
-        for r in data["data"]:
-            pe = r.get("put_options",  {})
-            ce = r.get("call_options", {})
-            if pe and pe.get("market_data"):
-                pe_oi += pe["market_data"].get("oi", 0)
-            if ce and ce.get("market_data"):
-                ce_oi += ce["market_data"].get("oi", 0)
+        # Step 2: Try each expiry nearest-first, pick first with real OI
+        for expiry_str in expiries[:5]:
+            resp = requests.get(
+                "https://api.upstox.com/v2/option/chain",
+                headers=headers,
+                params={"instrument_key": "NSE_INDEX|Nifty 50",
+                        "expiry_date": expiry_str},
+                timeout=10
+            )
+            data = resp.json()
+            if data.get("status") != "success" or not data.get("data"):
+                log.info(f"PCR: expiry {expiry_str} — no data, trying next")
+                continue
 
-        if ce_oi == 0:
-            return "neutral", None
+            pe_oi = ce_oi = 0
+            for r in data["data"]:
+                pe = r.get("put_options",  {}) or {}
+                ce = r.get("call_options", {}) or {}
+                if pe.get("market_data"):
+                    pe_oi += pe["market_data"].get("oi", 0)
+                if ce.get("market_data"):
+                    ce_oi += ce["market_data"].get("oi", 0)
 
-        pcr  = round(pe_oi / ce_oi, 2)
-        bias = "bullish" if pcr > 1.2 else "bearish" if pcr < 0.8 else "neutral"
-        log.info(f"PCR: {pcr} → {bias}")
-        return bias, pcr
+            if ce_oi > 0 and (pe_oi + ce_oi) > 1000:
+                pcr  = round(pe_oi / ce_oi, 2)
+                bias = "bullish" if pcr > 1.2 else "bearish" if pcr < 0.8 else "neutral"
+                log.info(f"PCR: {pcr} → {bias} (expiry:{expiry_str} PE:{pe_oi} CE:{ce_oi})")
+                return bias, pcr
+            else:
+                log.info(f"PCR: expiry {expiry_str} — low OI (PE:{pe_oi} CE:{ce_oi}), trying next")
+
+        log.warning("PCR: all expiries had zero/low OI")
+        return "neutral", None
 
     except Exception as e:
         log.error(f"PCR error: {e}")

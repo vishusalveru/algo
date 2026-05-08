@@ -364,8 +364,39 @@ class SessionBias:
 
 
 # ─────────────────────────────────────────────
-#  PCR CACHE (15-min refresh)
+#  LIVE EXPIRY FETCH + PCR CACHE (15-min refresh)
 # ─────────────────────────────────────────────
+def get_live_expiries(instrument_key=None):
+    """
+    Fetch actual available expiry dates from Upstox option/contract endpoint.
+    Returns list sorted nearest-first. No hardcoded weekday math — works
+    regardless of NSE expiry day changes (Thursday→Monday etc).
+    """
+    if instrument_key is None:
+        instrument_key = NIFTY_KEY
+    try:
+        resp = requests.get(
+            "https://api.upstox.com/v2/option/contract",
+            headers=get_headers(),
+            params={"instrument_key": instrument_key},
+            timeout=10
+        )
+        data = resp.json()
+        if data.get("status") != "success" or not data.get("data"):
+            log.warning(f"get_live_expiries: {data.get('status')} — {data.get('message','')}")
+            return []
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        expiries  = sorted(set(
+            item["expiry"] for item in data["data"]
+            if "expiry" in item and item["expiry"] >= today_str
+        ))
+        log.info(f"Live expiries: {expiries[:6]}")
+        return expiries
+    except Exception as e:
+        log.error(f"get_live_expiries error: {e}")
+        return []
+
+
 class PCRCache:
     def __init__(self):
         self.val = None; self.bias = "neutral"; self.time = None
@@ -375,37 +406,45 @@ class PCRCache:
         return (datetime.datetime.now() - self.time).seconds
 
     def fetch(self):
+        """Fetch PCR using live expiry dates — no hardcoded date guessing."""
         try:
-            today = datetime.date.today()
-            # [F4] Try multiple expiries to handle non-Thursday expiries
-            for add in [0, 7, 14, 21]:
-                d = (3 - today.weekday()) % 7 + add
-                if d == 0: d = 7
-                exp = today + datetime.timedelta(days=d)
+            expiries = get_live_expiries()
+            if not expiries:
+                log.warning("PCR: no live expiries available")
+                return self.val, self.bias, "stale"
+
+            for expiry_str in expiries[:5]:
                 resp = requests.get(
                     "https://api.upstox.com/v2/option/chain",
                     headers=get_headers(),
                     params={"instrument_key": NIFTY_KEY,
-                            "expiry_date": exp.strftime("%Y-%m-%d")},
+                            "expiry_date": expiry_str},
                     timeout=10)
                 data = resp.json()
-                if data["status"] != "success" or not data.get("data"): continue
+                if data.get("status") != "success" or not data.get("data"):
+                    log.info(f"PCR: {expiry_str} — no data, trying next")
+                    continue
                 pe = ce = 0
                 for r in data["data"]:
-                    p = r.get("put_options", {})
-                    c = r.get("call_options", {})
-                    if p and p.get("market_data"): pe += p["market_data"].get("oi", 0)
-                    if c and c.get("market_data"): ce += c["market_data"].get("oi", 0)
-                if ce > 0:
-                    pcr = round(pe / ce, 2)
+                    p = r.get("put_options",  {}) or {}
+                    c = r.get("call_options", {}) or {}
+                    if p.get("market_data"): pe += p["market_data"].get("oi", 0)
+                    if c.get("market_data"): ce += c["market_data"].get("oi", 0)
+                if ce > 0 and (pe + ce) > 1000:
+                    pcr  = round(pe / ce, 2)
                     bias = "bullish" if pcr > 1.2 else "bearish" if pcr < 0.8 else "neutral"
-                    self.val = pcr; self.bias = bias
+                    self.val  = pcr; self.bias = bias
                     self.time = datetime.datetime.now()
-                    log.info(f"PCR:{pcr}({bias}) exp:{exp}")
+                    log.info(f"PCR:{pcr}({bias}) expiry:{expiry_str} PE:{pe} CE:{ce}")
                     return pcr, bias, "fresh"
+                else:
+                    log.info(f"PCR: {expiry_str} — low OI (PE:{pe} CE:{ce}), next")
+
+            log.warning("PCR: all expiries had zero/low OI")
             return self.val, self.bias, "stale"
         except Exception as e:
-            log.error(f"PCR:{e}"); return self.val, self.bias, "error"
+            log.error(f"PCR fetch error: {e}")
+            return self.val, self.bias, "error"
 
     def get(self):
         a = self.age()
@@ -1201,10 +1240,16 @@ class StrategyTracker:
 def get_option_details(nifty_price, option_type):
     atm    = round(nifty_price / 50) * 50
     strike = atm + OTM_OFFSET if option_type == "CE" else atm - OTM_OFFSET
-    today  = datetime.date.today()
-    days   = (3 - today.weekday()) % 7
-    if days == 0: days = 7
-    expiry = today + datetime.timedelta(days=days)
+    # Use live expiry — nearest available from the market
+    expiries = get_live_expiries()
+    if expiries:
+        expiry = expiries[0]   # nearest expiry
+    else:
+        # Fallback: next Monday
+        today  = datetime.date.today()
+        days   = (0 - today.weekday()) % 7
+        if days == 0: days = 7
+        expiry = (today + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
     return strike, expiry
 
 def is_expiry_day(): return datetime.date.today().weekday() == 3
