@@ -139,6 +139,7 @@ PCR_STALE_SECS       = 1800
 GAP_FILTER_PCT       = 0.5
 ATR_PERIOD           = 14
 ATR_TRENDING_MIN     = 15
+ATR_MIN_FOR_TRADE    = 20     # [F29] CSV: 18pts ATR session was 0% WR — block all strategies below 20pts
 VWAP_CROSS_VOL_MIN   = 1.2
 RSI_PERIOD           = 14
 RSI_OVERBOUGHT       = 65
@@ -892,15 +893,42 @@ def detect_fvg(df):
     return None, f"No valid FVG (max {FVG_MAX_AGE_CANDLES}c)"
 
 def detect_orb(df, orb_high, orb_low, ltp):
-    """[F6] ORB direction from actual breakout price, not forced by bias."""
-    if orb_high is None or orb_low is None: return None, "ORB not formed yet"
-    if ltp:
-        if ltp > orb_high and round(ltp - orb_high, 1) >= 5:
-            return {"type": "bullish", "level": orb_high, "size": round(ltp - orb_high, 1)}, \
-                   f"ORB bullish {round(ltp - orb_high, 1)}pts above {orb_high:.0f}"
-        if ltp < orb_low and round(orb_low - ltp, 1) >= 5:
-            return {"type": "bearish", "level": orb_low, "size": round(orb_low - ltp, 1)}, \
-                   f"ORB bearish {round(orb_low - ltp, 1)}pts below {orb_low:.0f}"
+    """
+    [F6] ORB direction from actual breakout price.
+    [F30] CSV-DRIVEN PATCH: Require last CLOSED candle to close beyond
+    the ORB level, not just an LTP tick. On 2026-05-08 ORB+EMA fired
+    at 24131 (LTP just below ORB low 24138) and exited in 30 seconds
+    — pure stop-run / wick break. Closed-candle confirmation prevents
+    this.
+    """
+    if orb_high is None or orb_low is None:
+        return None, "ORB not formed yet"
+    if df is None or len(df) < 2:
+        return None, "ORB: insufficient candle data"
+    if not ltp:
+        return None, "ORB: no LTP"
+
+    # Use the last CLOSED candle's close (df.iloc[-1] is current forming candle,
+    # df.iloc[-2] is the last fully closed candle)
+    try:
+        last_close = float(df["close"].iloc[-2])
+    except Exception:
+        last_close = ltp
+
+    # Require BOTH: LTP beyond level AND last closed candle beyond level
+    if ltp > orb_high and last_close > orb_high and round(ltp - orb_high, 1) >= 5:
+        return {"type": "bullish", "level": orb_high,
+                "size": round(ltp - orb_high, 1)}, \
+               f"ORB bullish {round(ltp-orb_high,1)}pts above {orb_high:.0f} (close confirmed)"
+    if ltp < orb_low and last_close < orb_low and round(orb_low - ltp, 1) >= 5:
+        return {"type": "bearish", "level": orb_low,
+                "size": round(orb_low - ltp, 1)}, \
+               f"ORB bearish {round(orb_low-ltp,1)}pts below {orb_low:.0f} (close confirmed)"
+    # If LTP is beyond but candle hasn't closed yet, signal not valid yet
+    if ltp > orb_high and last_close <= orb_high:
+        return None, f"ORB tick break above {orb_high:.0f} — waiting for close confirm"
+    if ltp < orb_low and last_close >= orb_low:
+        return None, f"ORB tick break below {orb_low:.0f} — waiting for close confirm"
     return None, f"No ORB | Range {orb_low:.0f} to {orb_high:.0f}"
 
 def detect_ema_stack(df_ema, ltp, t5, rvol):
@@ -989,15 +1017,35 @@ def detect_ema50_bounce(df_ema, ltp, t5, df_5):
         return None, f"EMA50 near {e50:.0f} no candle confirm"
     except: return None, "EMA50 error"
 
-def detect_supertrend_signal(df, trend):
-    """[Strategy 8] Fresh SuperTrend flip aligned with multi-TF trend."""
+def detect_supertrend_signal(df, trend, ltp=None, atr=None):
+    """
+    [Strategy 8] Fresh SuperTrend flip aligned with multi-TF trend.
+
+    [F28] CSV-DRIVEN PATCH: Distance check added.
+    On 2026-05-08 ST fired with level 24224 while Nifty was at 24158
+    (66pts gap) — ST was lagging the actual move. Result: instant SL.
+
+    A valid SuperTrend flip should have price within ~2x ATR of the
+    ST level. Otherwise the signal is stale/lagging and price is too
+    far extended for the flip to be meaningful.
+    """
     st_dir, st_level, is_fresh = calc_supertrend(df)
     if not is_fresh:
         return None, f"SuperTrend: no fresh flip (current:{st_dir})"
-    if st_dir == trend:
-        return {"type": st_dir, "level": st_level, "fresh": True}, \
-               f"SuperTrend flip to {st_dir} at {st_level:.0f}"
-    return None, f"SuperTrend {st_dir} conflicts trend {trend}"
+    if st_dir != trend:
+        return None, f"SuperTrend {st_dir} conflicts trend {trend}"
+
+    # [F28] Distance check — price must be near ST level
+    if ltp is not None and atr is not None:
+        distance = abs(ltp - st_level)
+        max_distance = atr * 2.0   # 2x ATR
+        if distance > max_distance:
+            return None, (f"SuperTrend STALE — price {ltp:.0f} too far from "
+                          f"ST level {st_level:.0f} (gap:{distance:.0f}pts > "
+                          f"{max_distance:.0f}pts max)")
+
+    return {"type": st_dir, "level": st_level, "fresh": True}, \
+           f"SuperTrend flip to {st_dir} at {st_level:.0f}"
 
 def detect_cpr_signal(ltp, pivot, bc, tc, trend, prev_ltp=None):
     """
@@ -1025,7 +1073,19 @@ def detect_cpr_signal(ltp, pivot, bc, tc, trend, prev_ltp=None):
 # ─────────────────────────────────────────────
 def calc_confidence(direction, trend, e9, e21, e50, ltp,
                     vwap, pcr_bias, pcr_weight, rvol, pre_bias,
-                    t5, t15, t30):
+                    t5, t15, t30, rsi=50):
+    """
+    [F31] CSV-DRIVEN PATCH: RSI now factors into confidence score.
+    On 2026-05-08 both losing trades scored 8/10 HIGH despite RSI 32-34.
+    RSI now contributes:
+      - SHORT @ RSI < 40   : -1 penalty (oversold, bounce risk)
+      - LONG  @ RSI > 60   : -1 penalty (overbought, pullback risk)
+      - SHORT @ RSI 40-60  : 0
+      - LONG  @ RSI 40-60  : 0
+      - SHORT @ RSI > 60   : +1 (room to fall)
+      - LONG  @ RSI < 40   : +1 (room to rise — counter-trend bounce)
+    Max score still 10 since other points may go down.
+    """
     score = 0; reasons = []
 
     # 1. Multi-TF trend alignment (+2)
@@ -1080,12 +1140,31 @@ def calc_confidence(direction, trend, e9, e21, e50, ltp,
     else:
         reasons.append("EMA50 wrong side +0")
 
-    # 8. [NEW] All 3 TFs agree (+1) — replaces nothing, adds point
+    # 8. MTF 3/3 agreement (+1)
     all_agree = (t5 == direction and t15 == direction and t30 == direction)
     if all_agree:
         score += 1; reasons.append("MTF 3/3 agree +1")
     else:
         reasons.append(f"MTF partial {t5}/{t15}/{t30} +0")
+
+    # 9. [F31] RSI factor — penalise extremes against direction
+    if direction == "bearish":
+        if rsi < 40:
+            score -= 1; reasons.append(f"RSI {rsi:.0f} oversold -1 (bounce risk)")
+        elif rsi > 60:
+            score += 1; reasons.append(f"RSI {rsi:.0f} room to fall +1")
+        else:
+            reasons.append(f"RSI {rsi:.0f} mid-range +0")
+    elif direction == "bullish":
+        if rsi > 60:
+            score -= 1; reasons.append(f"RSI {rsi:.0f} overbought -1 (pullback risk)")
+        elif rsi < 40:
+            score += 1; reasons.append(f"RSI {rsi:.0f} room to rise +1")
+        else:
+            reasons.append(f"RSI {rsi:.0f} mid-range +0")
+
+    # Clamp to [0, 10]
+    score = max(0, min(10, score))
 
     label = "HIGH" if score >= HIGH_CONF else "MEDIUM" if score >= MEDIUM_CONF else "LOW"
     return score, label, reasons
@@ -1991,7 +2070,7 @@ def run():
         vwap_cx, vwap_cx_r = detect_vwap_cross(df5_vwap, ltp, df_5)
         ema50_b, ema50_r   = detect_ema50_bounce(df5_ema, ltp, t5, df_5)
         st_dir, st_level, st_fresh = calc_supertrend(df_5)
-        st_sig,  st_r      = detect_supertrend_signal(df_5, trend)
+        st_sig,  st_r      = detect_supertrend_signal(df_5, trend, ltp, atr)
         cpr_sig, cpr_r     = detect_cpr_signal(ltp, cpr_pivot, cpr_bc, cpr_tc,
                                                 trend, prev_ltp if prev_ltp else ltp)
         prev_df5_ema = df5_ema.copy()
@@ -2044,7 +2123,8 @@ def run():
                     prev_dir = trend
                 conf_prev, _, _ = calc_confidence(
                     prev_dir, trend, e9, e21, e50, ltp,
-                    vwap, pcr_b, pcr_weight, rvol, pre_bias, t5, t15, t30
+                    vwap, pcr_b, pcr_weight, rvol, pre_bias, t5, t15, t30,
+                    rsi
                 )
 
             write_scan({
@@ -2186,10 +2266,42 @@ def run():
                 _skip(f"Session: {sess_reason}")
                 return False
 
+            # [F27] CSV-DRIVEN PATCH: Block trend-following entries at RSI extremes.
+            #
+            # 2026-05-08 lesson: Bot bought 2 PEs at RSI 32-34 → both stopped out
+            # when price bounced. RSI extremes signal mean reversion is likely,
+            # so trend-following entries against the extreme are dangerous.
+            #
+            # Rule:
+            #   SHORT (PE) blocked when RSI < 35 (oversold — bounce likely)
+            #   LONG  (CE) blocked when RSI > 65 (overbought — pullback likely)
+            #
+            # Only mean-reversion strategies (session bias allows counter-trend
+            # via Z-score gate above) bypass this. For directional strategies
+            # this is a hard block.
+            if direction == "bearish" and rsi < RSI_OVERSOLD:
+                log.info(f"{strategy_name} RSI {rsi:.0f} oversold — SHORT blocked")
+                _skip(f"RSIBlock: SHORT @ RSI {rsi:.0f} < {RSI_OVERSOLD} (oversold)")
+                return False
+            if direction == "bullish" and rsi > RSI_OVERBOUGHT:
+                log.info(f"{strategy_name} RSI {rsi:.0f} overbought — LONG blocked")
+                _skip(f"RSIBlock: LONG @ RSI {rsi:.0f} > {RSI_OVERBOUGHT} (overbought)")
+                return False
+
+            # [F29] CSV-DRIVEN PATCH: Block all trades when ATR is too low.
+            # 2026-05-08: avg ATR 18pts, both trades stopped out. Options
+            # need volatility to move. Below 20pts ATR, theta decay > price
+            # movement potential.
+            if atr < ATR_MIN_FOR_TRADE:
+                log.info(f"{strategy_name} ATR {atr:.0f} < {ATR_MIN_FOR_TRADE} — dead volatility")
+                _skip(f"ATRTooLow: {atr:.0f}pts < {ATR_MIN_FOR_TRADE}pts min")
+                return False
+
             # Confidence score (now /10)
             conf_score, conf_label, conf_reasons = calc_confidence(
                 direction, trend, e9, e21, e50, ltp,
-                vwap, pcr_b, pcr_weight, rvol, pre_bias, t5, t15, t30
+                vwap, pcr_b, pcr_weight, rvol, pre_bias, t5, t15, t30,
+                rsi
             )
 
             # [F11] Re-check with actual conf score
