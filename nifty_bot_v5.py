@@ -1831,8 +1831,12 @@ def run():
         fut_df = get_futures_candles(5)
         if ltp is None or df_5 is None:
             time.sleep(15); continue
+        # Use first candle's open as open_price — more accurate than LTP at start
         if open_price is None:
-            open_price = ltp
+            try:
+                open_price = float(df_5["open"].iloc[0])
+            except Exception:
+                open_price = ltp
 
         # [F12] VIX spike guard
         india_vix = get_india_vix()
@@ -1917,7 +1921,7 @@ def run():
         st_dir, st_level, st_fresh = calc_supertrend(df_5)
         st_sig,  st_r      = detect_supertrend_signal(df_5, trend)
         cpr_sig, cpr_r     = detect_cpr_signal(ltp, cpr_pivot, cpr_bc, cpr_tc,
-                                                trend, prev_ltp)
+                                                trend, prev_ltp if prev_ltp else ltp)
         prev_df5_ema = df5_ema.copy()
 
         # 5-min scan log
@@ -2050,7 +2054,7 @@ def run():
                 f"FVG          : {fvg_r[:45] if fvg else 'NONE'}",
                 f"ORB          : {orb_r[:45]}",
                 f"EMA Stack    : {ema_sk_r[:35] if ema_stk else 'NONE'}",
-                f"SuperTrend   : {st_r[:40]}",
+                f"SuperTrend   : {st_r[:55]}",
                 f"CPR signal   : {cpr_r[:40]}",
                 f"VWAP Cross   : {vwap_cx_r[:35] if vwap_cx else 'NONE'}",
                 f"PCR          : {pcr_v or 'N/A'} ({pcr_b}) [{pcr_status}]",
