@@ -653,12 +653,22 @@ def calc_rsi(df, period=RSI_PERIOD):
 
 def calc_vwap_bands(df, atr):
     df = df.copy()
+    df["volume"]   = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["typical"]  = (df["high"] + df["low"] + df["close"]) / 3
-    df["cum_vol"]  = df["volume"].cumsum()
-    df["cum_tv"]   = (df["typical"] * df["volume"]).cumsum()
+
+    # Guard: if all volume is 0 (Upstox index candles often have no volume)
+    # fall back to equal-weight VWAP (treat each candle as weight=1)
+    total_vol = df["volume"].sum()
+    if total_vol == 0:
+        df["weight"]  = 1.0
+    else:
+        df["weight"]  = df["volume"]
+
+    df["cum_vol"]  = df["weight"].cumsum()
+    df["cum_tv"]   = (df["typical"] * df["weight"]).cumsum()
     df["vwap"]     = df["cum_tv"] / df["cum_vol"]
-    df["cum_tv2"]  = (((df["typical"] - df["vwap"]) ** 2) * df["volume"]).cumsum()
-    df["sd"]       = np.sqrt(df["cum_tv2"] / df["cum_vol"])
+    df["cum_tv2"]  = (((df["typical"] - df["vwap"]) ** 2) * df["weight"]).cumsum()
+    df["sd"]       = np.sqrt((df["cum_tv2"] / df["cum_vol"]).clip(lower=0))
     mult = 1.5 if atr > 30 else 1.0 if atr > 15 else 0.75
     df["vwap_u1"]  = df["vwap"] + mult * df["sd"]
     df["vwap_l1"]  = df["vwap"] - mult * df["sd"]
@@ -1574,6 +1584,28 @@ def run():
             time.sleep(30); continue
 
         premarket_done = False
+
+        # If bot started after 9:30 (missed premarket), run auto bias immediately
+        if not premarket_done and auto_bias_report == {} and prev_ohlc is None:
+            log.info("Bot started after premarket — running auto bias now")
+            prev_ohlc = get_prev_day_ohlc()
+            try:
+                final_bias, bias_report = get_combined_bias_nifty(
+                    config.LIVE_TOKEN,
+                    prev_ohlc["close"] if prev_ohlc else None,
+                    tg_listener.bias
+                )
+                pre_bias         = final_bias
+                auto_bias_report = bias_report
+                tg_listener.set_auto_bias(bias_report.get("final_bias", "neutral"))
+                pcr_cache.fetch()
+                send_telegram(
+                    "⚠️ <b>Bot started after premarket — running auto bias now</b>\n"
+                    + format_bias_message_nifty(bias_report)
+                )
+            except Exception as e:
+                log.error(f"Late auto bias error: {e}")
+                send_telegram(f"⚠️ Auto bias failed on late start: {e}\nSend /bias manually.")
 
         # Session end
         if t >= TRADE_END:
