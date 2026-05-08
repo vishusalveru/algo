@@ -119,11 +119,11 @@ ORB_END_TIME         = datetime.time(9, 45)
 SESSION_BIAS_END     = datetime.time(10, 0)
 TIME_EXIT_AFTER      = datetime.time(14, 0)
 TRADE_MAX_DURATION   = 30     # [F9] hard 30-min per-trade exit
-MAX_TRADES           = 15
+MAX_TRADES           = 999    # PAPER: uncapped — collect max data
 CAPITAL_PER_TRADE    = 6500
 CAPITAL_REDUCED      = 3250
-DAILY_LOSS_LIMIT     = 3000
-DAILY_PROFIT_TARGET  = 2000
+DAILY_LOSS_LIMIT     = 999999   # PAPER: no limit — log everything
+DAILY_PROFIT_TARGET  = 999999   # PAPER: no limit — let all signals fire
 LOT_SIZE             = 65     # Nifty lot size (revised to 65 from Jan 2026, was 75)
 OTM_OFFSET           = 100
 MIN_RVOL             = 1.0
@@ -476,11 +476,12 @@ def tg(icon, title, lines):
 
 def send_csv_files():
     files = [
-        ("scan_log_v5.csv",  "Nifty Scan v5  — 5min market snapshots"),
-        ("trade_log_v5.csv", "Nifty Trade v5 — all completed trades"),
-        ("skip_log_v5.csv",  "Nifty Skip v5  — all rejected signals + reasons"),
+        (_LOG_FILES.get("scan",  "scan_log_v5.csv"),  "Nifty Scan v5  — 5min market snapshots"),
+        (_LOG_FILES.get("trade", "trade_log_v5.csv"), "Nifty Trade v5 — all completed trades"),
+        (_LOG_FILES.get("skip",  "skip_log_v5.csv"),  "Nifty Skip v5  — all rejected signals"),
     ]
-    send_telegram("📊 <b>Nifty v5 Daily CSVs (3 files)</b>")
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    send_telegram(f"📊 <b>Nifty v5 CSVs — {date_str}</b>")
     sent = 0
     for fname, caption in files:
         if not os.path.exists(fname): continue
@@ -490,8 +491,8 @@ def send_csv_files():
                 resp = requests.post(url, data={"chat_id": config.CHAT_ID, "caption": caption},
                                      files={"document": f}, timeout=30)
             if resp.json().get("ok"): sent += 1
-        except Exception as e: log.error(f"CSV:{e}")
-    send_telegram(f"✅ Sent {sent}/{len(files)} files — upload all 3 to Claude for full analysis!")
+        except Exception as e: log.error(f"CSV send:{e}")
+    send_telegram(f"✅ Sent {sent}/3 files — upload all 3 to Claude for analysis!")
 
 
 # ─────────────────────────────────────────────
@@ -558,7 +559,7 @@ class TelegramListener:
                             f"  Manual bias: {self.bias.upper()}{bias_age}\n"
                             f"  Auto bias  : {self._auto_bias.upper()}\n"
                             f"  Session    : {self._sb.bias.upper()}\n"
-                            f"  Trades     : {s['trades']}/{MAX_TRADES}\n"
+                            f"  Trades     : {s['trades']} (uncapped paper)\n"
                             f"  Wins       : {s['wins']} | Losses: {s['losses']}\n"
                             f"  Win rate   : {wr:.1f}%\n"
                             f"  Day P&L    : Rs.{s['pnl']:+.0f}\n"
@@ -572,8 +573,6 @@ class TelegramListener:
                             "📋 <b>Commands:</b>\n"
                             "  /bias bullish|bearish|neutral\n"
                             "    → Manual FII/DII bias (40% weight)\n"
-                            "    → Auto-bias handles rest from PCR, VIX,\n"
-                            "       GIFT Nifty, Moneycontrol news\n"
                             "  /status — current bot state + both biases\n"
                             "  /report — send CSV logs to this chat\n"
                             "  /help   — this message"
@@ -1394,28 +1393,64 @@ SKIP_COLS = [
     "nifty_ltp", "trades_today", "daily_pnl"
 ]
 
+def get_log_filenames():
+    """
+    Date-stamped CSV filenames so each trading day gets its own file.
+    Restart-safe: same day restarts append to the same file.
+    e.g. scan_log_v5_2026-05-08.csv
+    """
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    return {
+        "scan"  : f"scan_log_v5_{date_str}.csv",
+        "trade" : f"trade_log_v5_{date_str}.csv",
+        "skip"  : f"skip_log_v5_{date_str}.csv",
+    }
+
+# Module-level log file paths — set once at startup
+_LOG_FILES = {}
+
 def init_logs():
-    for fname, cols in [("scan_log_v5.csv", SCAN_COLS),
-                        ("trade_log_v5.csv", TRADE_COLS),
-                        ("skip_log_v5.csv",  SKIP_COLS)]:
+    """
+    Initialise CSV log files for today.
+    - New day → new files with fresh headers
+    - Same day restart → append to existing files, write restart marker
+    """
+    global _LOG_FILES
+    _LOG_FILES = get_log_filenames()
+
+    for key, fname, cols in [
+        ("scan",  _LOG_FILES["scan"],  SCAN_COLS),
+        ("trade", _LOG_FILES["trade"], TRADE_COLS),
+        ("skip",  _LOG_FILES["skip"],  SKIP_COLS),
+    ]:
         if not os.path.exists(fname):
+            # New file — write header
             with open(fname, "w", newline="") as f:
                 csv.DictWriter(f, fieldnames=cols).writeheader()
-    log.info("Nifty v5 logs initialised (scan + trade + skip)")
+            log.info(f"Created {fname}")
+        else:
+            # File exists (same-day restart) — append a restart marker row
+            # so analysts can see exactly where the restart happened
+            marker = {c: "" for c in cols}
+            marker[cols[0]] = f"=== BOT RESTART {datetime.datetime.now().strftime('%H:%M:%S')} ==="
+            with open(fname, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=cols).writerow(marker)
+            log.info(f"Appending to existing {fname} (same-day restart)")
+
+    log.info(f"Logs: {_LOG_FILES['trade']}")
 
 def write_scan(rec):
-    with open("scan_log_v5.csv", "a", newline="") as f:
+    with open(_LOG_FILES["scan"], "a", newline="") as f:
         row = {c: rec.get(c, "") for c in SCAN_COLS}
         csv.DictWriter(f, fieldnames=SCAN_COLS).writerow(row)
 
 def write_trade(rec):
-    with open("trade_log_v5.csv", "a", newline="") as f:
+    with open(_LOG_FILES["trade"], "a", newline="") as f:
         row = {c: rec.get(c, "") for c in TRADE_COLS}
         csv.DictWriter(f, fieldnames=TRADE_COLS).writerow(row)
 
 def write_skip(rec):
-    """Log every skipped signal — lets you analyse what the bot rejected and why."""
-    with open("skip_log_v5.csv", "a", newline="") as f:
+    with open(_LOG_FILES["skip"], "a", newline="") as f:
         row = {c: rec.get(c, "") for c in SKIP_COLS}
         csv.DictWriter(f, fieldnames=SKIP_COLS).writerow(row)
 
@@ -1581,13 +1616,14 @@ def run():
         f"🤖 <b>Nifty Bot v5 — Strategy Testing Build</b>\n\n"
         f"  Token check  : ✅ Live (LTP:{startup_ltp:.0f})\n"
         f"  Paper trading: ✅ No real orders\n"
+        f"  Mode         : UNCAPPED — max data collection\n"
         f"  RR Ratio     : 1:{TARGET_POINTS/SL_POINTS:.1f} (SL:{SL_POINTS} TGT:{TARGET_POINTS}pts)\n"
         f"  Slippage     : {SLIPPAGE_PTS}pts simulated\n"
         f"  Max/trade    : {TRADE_MAX_DURATION}min hard exit\n"
-        f"  Strategies   : 9 (7 proven + SuperTrend + CPR)\n"
-        f"  Max trades   : {MAX_TRADES}/day\n"
-        f"  Loss limit   : Rs.{DAILY_LOSS_LIMIT}\n"
-        f"  Profit target: Rs.{DAILY_PROFIT_TARGET}\n\n"
+        f"  Strategies   : 9 (all active — testing phase)\n"
+        f"  Trades/day   : Unlimited (paper)\n"
+        f"  Loss limit   : None (paper — soft alerts only)\n"
+        f"  Profit target: None (paper — soft alerts only)\n\n"
         f"  Resumed P&L  : Rs.{stats['pnl']:+.0f} "
         f"({stats['trades']} trades today)\n\n"
         f"📋 <b>Commands:</b>\n"
@@ -1599,6 +1635,7 @@ def run():
     while True:
         t   = ist_time()
         now = now_ist()
+        today = now.date()
 
         # Pre-market reminder (9:00 AM)
         if not reminder_sent and REMINDER_TIME <= t < TRADE_START:
@@ -1652,57 +1689,46 @@ def run():
                 log.error(f"Late auto bias error: {e}")
                 send_telegram(f"⚠️ Auto bias failed on late start: {e}\nSend /bias manually.")
 
-        # Session end
+        # Session end — send summary + CSVs then exit cleanly
+        # Cron job restarts the bot at 8:45 AM next trading day
         if t >= TRADE_END:
             if not closed_summary_sent:
                 send_summary(stats, pre_bias, pcr_cache, session_bias, cap_mgr, strat_tracker)
                 closed_summary_sent = True
-                save_state(stats, manual_bias="neutral")   # explicit: clear bias for next day
-                # Reset for next day
-                stats = {
-                    "date": str(datetime.date.today()),
-                    "pnl": 0.0, "trades": 0, "wins": 0, "losses": 0,
-                    "timeouts": 0, "skipped": 0, "consec_loss": 0,
-                    "fvg": 0, "orb": 0, "ema_stack": 0,
-                    "vwap_band": 0, "vwap_cross": 0,
-                    "ema_cross": 0, "ema50": 0,
-                    "supertrend": 0, "cpr": 0,
-                    "high_t": 0, "high_w": 0,
-                    "med_t": 0, "med_w": 0,
-                    "low_t": 0, "low_w": 0
-                }
-                trade_no = 0; active_trade = None; last_scan = None
-                pre_bias = "neutral"; orb_high = orb_low = None; orb_formed = False
-                strat_tracker = StrategyTracker()
-                tg_listener.bias = "neutral"
-                reminder_sent = False; premarket_done = False
-                open_price = None; closed_summary_sent = False
-                prev_df5_ema = None; prev_ltp = None
-                session_bias = SessionBias(); pcr_cache = PCRCache()
-                cap_mgr = CapitalManager()
-            time.sleep(60); continue
+                save_state(stats, manual_bias="neutral")
+            log.info("14:30 — session complete. Exiting cleanly for cron.")
+            send_telegram(
+                "✅ <b>Session complete — Nifty v5</b>\n"
+                "Bot exiting. Cron restarts at 8:45 AM IST tomorrow."
+            )
+            break   # clean exit — do NOT loop, cron handles restart
 
         closed_summary_sent = False
 
         # Risk gates
-        if stats["trades"] >= MAX_TRADES:
-            time.sleep(30 * 60); continue
-        if stats["consec_loss"] >= 3:
-            tg("🛑", "Risk Protection — 3 Consecutive Losses",
-               [f"Stopping for the day. P&L: Rs.{stats['pnl']:+.0f}"])
-            send_summary(stats, pre_bias, pcr_cache, session_bias, cap_mgr, strat_tracker)
-            save_state(stats, tg_listener.bias)
-            time.sleep(16 * 3600); continue
-        if stats["pnl"] <= -DAILY_LOSS_LIMIT:
-            tg("🛑", "Daily Loss Limit Hit", [f"P&L:Rs.{stats['pnl']:+.0f}"])
-            send_summary(stats, pre_bias, pcr_cache, session_bias, cap_mgr, strat_tracker)
-            save_state(stats, tg_listener.bias)
-            time.sleep(16 * 3600); continue
-        if stats["pnl"] >= DAILY_PROFIT_TARGET:
-            tg("🎯", "Daily Profit Target!", [f"P&L:Rs.{stats['pnl']:+.0f}"])
-            send_summary(stats, pre_bias, pcr_cache, session_bias, cap_mgr, strat_tracker)
-            save_state(stats, tg_listener.bias)
-            time.sleep(16 * 3600); continue
+        # ── PAPER MODE: soft warnings only — bot never stops ────────
+        # These thresholds show what WOULD have happened in live trading.
+        # In v6/v7 these become hard stops. For now just log and alert once.
+        if stats["trades"] > 0 and stats["trades"] % 5 == 0:
+            tg("📊", f"Paper milestone: {stats['trades']} trades today",
+               [f"P&L: Rs.{stats['pnl']:+.0f}",
+                f"W:{stats['wins']} L:{stats['losses']} T:{stats['timeouts']}",
+                "Still running — paper mode, no cap"])
+
+        if stats["consec_loss"] >= 3 and stats["consec_loss"] % 3 == 0:
+            tg("⚠️", f"Paper alert: {stats['consec_loss']} consecutive losses",
+               [f"P&L: Rs.{stats['pnl']:+.0f}",
+                "Would stop in live — continuing paper for data"])
+
+        if stats["pnl"] <= -3000 and stats["pnl"] % 1000 < 50:
+            tg("⚠️", f"Paper alert: P&L at Rs.{stats['pnl']:+.0f}",
+               ["Would hit daily loss limit in live",
+                "Continuing paper — recording all signals"])
+
+        if stats["pnl"] >= 2000 and stats["pnl"] % 1000 < 50:
+            tg("💰", f"Paper alert: P&L at Rs.{stats['pnl']:+.0f}",
+               ["Would hit profit target in live",
+                "Continuing paper — recording all signals"])
         if is_expiry_day() and t >= EXPIRY_STOP:
             time.sleep(10 * 60); continue
 
@@ -1751,7 +1777,7 @@ def run():
                     f"Day P&L      : Rs.{stats['pnl']:+.0f}",
                     f"Strategy WR  : {s_wr} ({active_trade.strategy})",
                     f"Capital next : {cap_mgr.get_info()}",
-                    f"Trades today : {stats['trades']}/{MAX_TRADES}"
+                    f"Trades today : {stats['trades']} (paper, no cap)"
                 ])
                 write_trade({
                     "date": datetime.date.today(),
