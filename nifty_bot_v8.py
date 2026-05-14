@@ -160,8 +160,8 @@ STRONG_FVG_GAP       = 10
 STRONG_FVG_BODY      = 20
 MIN_FVG_BODY         = 10
 MIN_FVG_SIZE         = 5      # [V6-F6] skip FVGs < 5pts
+MIN_CANDLES_BEFORE_ENTRY = 6   # [P5] 30 min before non-ORB/BOS strategies
 FVG_MAX_AGE_CANDLES  = 3      # [F5] tighter freshness
-MIN_FVG_SIZE         = 5      # [V6-F6] was ~2pts in v5 — raised to 5pts min
 
 # ── ORB params ──────────────────────────────────────────────
 ORB_END_TIME         = datetime.time(9, 45)
