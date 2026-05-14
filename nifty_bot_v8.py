@@ -1612,6 +1612,16 @@ class GroupCapitalManager:
         cap = self.get_capital(group_id)
         return f"Grp{group_id} Rs.{cap} CL:{s['consec_loss']} CW:{s['consec_win']}"
 
+    def get_info(self):
+        """Summary of all groups — used in scan log and status messages."""
+        parts = []
+        for gid in STRATEGY_GROUPS:
+            s = self._state[gid]
+            cap = self.get_capital(gid)
+            status = "RED" if s["reduced"] else "OK"
+            parts.append(f"Grp{gid}:Rs.{cap}({status})")
+        return " | ".join(parts)
+
 
 # ─────────────────────────────────────────────
 #  [V8-F4] PAPER TRADE ENGINE — group-aware
