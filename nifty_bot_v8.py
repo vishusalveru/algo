@@ -940,7 +940,7 @@ def calc_atr(df, period=ATR_PERIOD):
                           abs(r["high"] - r["prev_close"]),
                           abs(r["low"]  - r["prev_close"])), axis=1)
         return round(float(df["tr"].ewm(span=period, adjust=False).mean().iloc[-1]), 1)
-    except: return 20.0
+    except Exception as _e: log.debug(f"ATR calc: {_e}"); return 20.0
 
 def calc_rsi(df, period=RSI_PERIOD):
     try:
@@ -950,7 +950,7 @@ def calc_rsi(df, period=RSI_PERIOD):
         rs    = gain / loss
         rsi   = 100 - (100 / (1 + rs))
         return round(float(rsi.iloc[-1]), 1)
-    except: return 50.0
+    except Exception as _e: log.debug(f"RSI calc: {_e}"); return 50.0
 
 def calc_vwap_bands(df, atr):
     df = df.copy()
@@ -998,7 +998,7 @@ def calc_rvol(df, fut_df=None):
                 avg = float(oi_chg.mean()); cur = float(oi_chg.iloc[-1])
                 if avg > 0: return round(max(0.5, min(5.0, cur / avg)), 2)
         return 1.2
-    except: return 1.2
+    except Exception as _e: log.debug(f"RVOL calc: {_e}"); return 1.2
 
 def calc_supertrend(df, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT):
     """
@@ -2147,6 +2147,15 @@ def run():
     vix_alert_sent     = False
     vix_alert_at       = None
     candles_seen       = 0    # [P5] 5m candles since open
+    # Safe defaults so try_trade closure always has these in scope
+    pcr_v = None; pcr_b = "neutral"; pcr_weight = 0.0; pcr_status = "excluded"
+    zscore = 0.0; trend = "neutral"; trend_strength = "none"
+    e9 = e21 = e50 = 0.0; vwap = 0.0; prev_vwap = 0.0
+    rsi = 50.0; atr = 30.0; rvol = 1.0
+    t5 = t15 = t30 = "neutral"; pre_bias = "neutral"
+    chg_pct = 0.0; bw = 0.0; vu1 = vl1 = 0.0
+    orb_s = orb_r = None; fvg = None; fvg_r = ""; ema_stk = None
+    vwap_bb = vwap_cx = ema50_b = ema_cx = st_sig = cpr_sig = None
 
     send_telegram(
         f"🤖 <b>Nifty Bot v8 — Multi-Trade Paper Build</b>\n\n"
@@ -2378,7 +2387,8 @@ def run():
                     ep = retest_waiter.get_ltp()
                     args = pending_trade_args
                     trade_no += 1
-                    active_trade = open_trade(
+                    _retest_gid = args.get("group_id", _get_group(args["strategy"])[0])
+                    active_trades[_retest_gid] = open_trade(
                         trade_no, args["strategy"], args["direction"], ep,
                         pcr_cache, tg_listener, pre_bias, args["is_strong"],
                         args["signal"], args["rvol"], args["trend_strength"],
@@ -2386,7 +2396,7 @@ def run():
                         args["conf_reasons"], session_bias, args["zscore"],
                         args["rsi"], args["atr"], args["vwap"], args["prev_vwap"],
                         args["e9"], args["e21"], args["e50"], args["capital"],
-                        args.get("auto_bias_report", auto_bias_report)   # [F19] pass bias snapshot
+                        args.get("auto_bias_report", auto_bias_report)
                     )
                     stats[args["stat_key"]] += 1
                 else:
@@ -2622,7 +2632,7 @@ def run():
                 # Build PDH/PDL/CPR strings safely (None values would crash f-strings)
                 # [F22] Guard against None before formatting
                 if prev_ohlc:
-                    pdh_str = f"PDH/PDL/PDC  : {prev_ohlc['high']:.0f}/{prev_ohlc['low']:.0f}/{prev_ohlc['close']:.0f}"
+                    pdh_str = (f"PDH/PDL/PDC  : {prev_ohlc['high']:.0f}/{prev_ohlc['low']:.0f}/{prev_ohlc['close']:.0f}" if prev_ohlc else "PDH/PDL/PDC  : N/A")
                 else:
                     pdh_str = "PDH/PDL/PDC  : N/A (no prev day data)"
                 if cpr_pivot is not None:
@@ -2996,11 +3006,11 @@ def run():
                     ep = get_nifty_ltp()
                     if ep is None: return False
                     trade_no += 1
-                    active_trade = open_trade(
+                    active_trades[gid] = open_trade(
                         trade_no, strategy_name, direction, ep,
                         pcr_cache, tg_listener, pre_bias, is_strong,
                         f"{signal_text} | {conf_label}({conf_score}/10) | "
-                        f"Sess:{session_bias.bias} Z:{zs:+.2f} RSI:{rsi:.0f}",
+                        f"Grp:{gid} Sess:{session_bias.bias} Z:{zs:+.2f} RSI:{rsi:.0f}",
                         rvol, trend_strength, risk,
                         conf_score, conf_label, conf_reasons,
                         session_bias, zs, rsi, atr,
