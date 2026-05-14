@@ -2714,7 +2714,7 @@ def run():
                     _skip(f"LateDayATR: {atr:.0f}pts < 30 after 14:00")
                     return False
 
-            # [P5] Min candles gate — block non-ORB/BOS in first 30 min
+                # [P5] Min candles gate — block non-ORB/BOS in first 30 min
                 if strategy_name not in ("ORB+EMA", "BOS") and candles_seen < MIN_CANDLES_BEFORE_ENTRY:
                     _skip(f"OpenNoise: {candles_seen} candles < {MIN_CANDLES_BEFORE_ENTRY} (30min gate)")
                     return False
@@ -2794,16 +2794,22 @@ def run():
                             return False
 
                 # Reversal risk check
-                proceed, risk, summary, rev_sigs = pre_trade_check_nifty(
-                    df_5, df_15, direction, pre_bias,
-                    prev_ohlc["close"] if prev_ohlc else None, prev_ohlc
-                )
-                send_telegram(format_reversal_alert_nifty(
-                    risk, proceed, rev_sigs, summary, strategy_name, direction
-                ))
-                if not proceed:
-                    _skip(f"RevRisk: {summary[:60]}", conf_score, conf_label)
-                    return False
+                # Counter-trend strategies skip bias-conflict check — conflicting
+                # with bias IS their signal (RSIDivergence, VWAPCross, CPR, StrongFVG)
+                _ct_strats = ("RSIDivergence", "VWAPCross", "CPR", "StrongFVG")
+                if strategy_name not in _ct_strats:
+                    proceed, risk, summary, rev_sigs = pre_trade_check_nifty(
+                        df_5, df_15, direction, pre_bias,
+                        prev_ohlc["close"] if prev_ohlc else None, prev_ohlc
+                    )
+                    send_telegram(format_reversal_alert_nifty(
+                        risk, proceed, rev_sigs, summary, strategy_name, direction
+                    ))
+                    if not proceed:
+                        _skip(f"RevRisk: {summary[:60]}", conf_score, conf_label)
+                        return False
+                else:
+                    risk = "LOW"  # counter-trend — skip reversal check
 
                 capital = cap_mgr.get_capital(gid)   # [V8-F7] per-group capital
 
@@ -2950,18 +2956,22 @@ def run():
                             return False
 
                 # Reversal risk pre-trade check
-                proceed, risk, summary, rev_sigs = pre_trade_check_nifty(
-                    df_5, df_15, direction, pre_bias,
-                    prev_ohlc["close"] if prev_ohlc else None, prev_ohlc
-                )
-                send_telegram(format_reversal_alert_nifty(
-                    risk, proceed, rev_sigs, summary, strategy_name, direction
-                ))
-                if not proceed:
-                    _skip(f"RevRisk: {summary[:60]}", conf_score, conf_label)
-                    return False
+                # Counter-trend strategies bypass this — conflicting bias IS their signal
+                if strategy_name not in ("RSIDivergence", "VWAPCross", "CPR", "StrongFVG"):
+                    proceed, risk, summary, rev_sigs = pre_trade_check_nifty(
+                        df_5, df_15, direction, pre_bias,
+                        prev_ohlc["close"] if prev_ohlc else None, prev_ohlc
+                    )
+                    send_telegram(format_reversal_alert_nifty(
+                        risk, proceed, rev_sigs, summary, strategy_name, direction
+                    ))
+                    if not proceed:
+                        _skip(f"RevRisk: {summary[:60]}", conf_score, conf_label)
+                        return False
+                else:
+                    risk = "LOW"  # counter-trend — skip reversal check
 
-                capital = cap_mgr.get_capital()
+                capital = cap_mgr.get_capital(gid)
 
                 if retest_zone:
                     bottom, top = retest_zone
