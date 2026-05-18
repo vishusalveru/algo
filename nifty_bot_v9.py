@@ -2263,6 +2263,7 @@ def run():
     vix_alert_sent     = False
     vix_alert_at       = None
     candles_seen       = 0    # [P5] 5m candles since open
+    ltp                = None  # safe default — assigned each scan
     # Safe defaults so try_trade closure always has these in scope
     pcr_v = None; pcr_b = "neutral"; pcr_weight = 0.0; pcr_status = "excluded"
     zscore = 0.0; trend = "neutral"; trend_strength = "none"
