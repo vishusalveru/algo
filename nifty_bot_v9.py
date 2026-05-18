@@ -2326,11 +2326,6 @@ def run():
 
             premarket_done = False
 
-            # [V9-REGIME-WINDOW] Need 18 candles before strategies fire
-            # Dynamic 1.8×ATR regime needs 12-candle window: candle 6+12=18
-            if candles_seen < 18:
-                time.sleep(60); continue
-
             # [V9-BIAS-REFRESH] Refresh auto_bias every 15 min intraday
             # PCR + FII + trend captured fresh every 15 min to stay aligned with market
             if not hasattr(run, "_last_bias_refresh"):
@@ -2579,6 +2574,10 @@ def run():
 
             # [P5] Track candles formed since open
             candles_seen = len(df_5)
+
+            # [V9-REGIME-WINDOW] Need 18 candles for regime classifier (1.8×ATR needs 12-candle window)
+            if candles_seen < 18:
+                time.sleep(60); continue
 
             # [V9-FIX2] Refresh option chain — dynamic TTL (5min high-vol, 15min normal)
             if option_chain is not None:
