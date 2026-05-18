@@ -2300,6 +2300,7 @@ def run():
 
     while True:
         try:
+            ltp = None   # ✅ ADD THIS
             t   = ist_time()
             now = now_ist()
             today = now.date()
