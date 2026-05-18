@@ -2211,7 +2211,12 @@ def open_trade(trade_no, strategy, direction, entry_price,
 #  MAIN LOOP
 # ─────────────────────────────────────────────
 def run():
-    ltp = None  # initialise here — Python scopes ltp as local to entire run()
+    # All variables that are assigned inside the while loop MUST be initialised
+    # here at function start — Python treats them as locals to the entire function.
+    # Without this, the except block crashes with UnboundLocalError.
+    ltp = None; atr = 30.0; rsi = 50.0; e9 = e21 = e50 = 0.0
+    vwap = 0.0; trend = "neutral"; rvol = 1.0; candles_seen = 0
+    prev_ltp = None; chg_pct = 0.0; zscore = 0.0
     init_logs()
 
     # [F15] Token health check before anything else
@@ -2909,7 +2914,7 @@ def run():
                 if option_chain is not None:
                     _oc_ok, _oc_reason, _oc_info = check_option_quality(
                         option_chain, ltp, direction,
-                        gcfg["sl"], gcfg["tgt"]
+                        gcfg["sl"], gcfg["target"]
                     )
                     if not _oc_ok:
                         _skip(f"OptionQuality: {_oc_reason}", conf_score, conf_label)

@@ -70,19 +70,45 @@ HEADERS_BASE = {
 }
 
 
-def get_nearest_expiry() -> str:
+def get_nearest_expiry(live_token: str = "") -> str:
     """
-    Returns nearest weekly Thursday expiry as YYYY-MM-DD.
-    Nifty weekly options expire every Thursday.
-    If today IS Thursday, use next Thursday (don't trade expiry day
-    unless specifically enabled — theta risk too high).
+    Returns nearest Nifty option expiry from Upstox live API.
+    Nifty now has BOTH Monday AND Thursday expiries (since 2025).
+    Computing expiry from weekday is unreliable — always fetch from API.
+    Falls back to nearest Thursday if API call fails.
     """
-    today    = datetime.date.today()
-    weekday  = today.weekday()   # 0=Mon … 6=Sun
-    thu      = 3                 # Thursday
-    days_to  = (thu - weekday) % 7
+    # Try fetching live expiry list from Upstox
+    if live_token:
+        try:
+            import requests
+            r = requests.get(
+                "https://api.upstox.com/v2/option/contract",
+                headers={"Authorization": f"Bearer {live_token}",
+                         "Accept": "application/json"},
+                params={"instrument_key": NIFTY_INSTRUMENT_KEY},
+                timeout=8
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                expiries = sorted(set(
+                    d.get("expiry","") for d in data
+                    if d.get("expiry","") >= datetime.date.today().strftime("%Y-%m-%d")
+                ))
+                if expiries:
+                    # Skip same-day expiry (theta risk) — use next one
+                    today_str = datetime.date.today().strftime("%Y-%m-%d")
+                    for exp in expiries:
+                        if exp > today_str:
+                            return exp
+                    return expiries[0]
+        except Exception as e:
+            log.warning(f"Expiry fetch failed: {e} — falling back to Thursday calc")
+
+    # Fallback: nearest Thursday
+    today   = datetime.date.today()
+    days_to = (3 - today.weekday()) % 7
     if days_to == 0:
-        days_to = 7              # skip same-day expiry
+        days_to = 7
     return (today + datetime.timedelta(days=days_to)).strftime("%Y-%m-%d")
 
 
@@ -167,7 +193,7 @@ class OptionChain:
         self._headers    = {**HEADERS_BASE, "Authorization": f"Bearer {live_token}"}
         self._chain      : Dict[int, Dict[str, OptionChainData]] = {}
         self._last_refresh = 0.0
-        self._expiry     = get_nearest_expiry()
+        self._expiry     = get_nearest_expiry(live_token)
         self._atm_strike = 0
         self._live_pcr   = 0.0
         self._fetch_ok   = False
@@ -186,7 +212,7 @@ class OptionChain:
             return self._fetch_ok
 
         # Update expiry if Thursday passed
-        self._expiry = get_nearest_expiry()
+        self._expiry = get_nearest_expiry(self._token)
         self._last_atr = atr  # [REVIEW-3] stored for dynamic TTL
         self._atm_strike = round_to_strike(nifty_ltp)
 
