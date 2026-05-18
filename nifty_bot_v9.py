@@ -2264,6 +2264,7 @@ def run():
     vix_alert_at       = None
     candles_seen       = 0    # [P5] 5m candles since open
     ltp                = None  # safe default — assigned each scan
+    _bias_refresh_ts   = 0.0   # timestamp of last bias refresh
     # Safe defaults so try_trade closure always has these in scope
     pcr_v = None; pcr_b = "neutral"; pcr_weight = 0.0; pcr_status = "excluded"
     zscore = 0.0; trend = "neutral"; trend_strength = "none"
@@ -2328,10 +2329,7 @@ def run():
             premarket_done = False
 
             # [V9-BIAS-REFRESH] Refresh auto_bias every 15 min intraday
-            # PCR + FII + trend captured fresh every 15 min to stay aligned with market
-            if not hasattr(run, "_last_bias_refresh"):
-                run._last_bias_refresh = 0
-            if time.time() - run._last_bias_refresh > 900 and auto_bias_report and ltp is not None:
+            if time.time() - _bias_refresh_ts > 900 and auto_bias_report and ltp is not None:
                 try:
                     _new_bias, _new_rep = get_combined_bias_nifty(
                         config.LIVE_TOKEN,
@@ -2351,7 +2349,7 @@ def run():
                         pre_bias         = _new_bias
                         auto_bias_report = _new_rep
                         tg_listener.set_auto_bias(_new_rep.get("final_bias", "neutral"))
-                    run._last_bias_refresh = time.time()
+                    _bias_refresh_ts = time.time()
                 except Exception as _br_err:
                     log.warning(f"Bias refresh failed: {_br_err}")
 
@@ -2421,6 +2419,7 @@ def run():
                 time.sleep(10 * 60); continue
 
             # [V8-F1][V8-F2] Monitor ALL active trades (one per group)
+            icon    = "⏸"  # default — reassigned per trade result
             ltp_now = get_nifty_ltp()
             for gid in list(active_trades.keys()):
                 active_trade = active_trades.get(gid)
@@ -2845,6 +2844,9 @@ def run():
 
                 if pending_trade_args:
                     return False   # retest in progress
+
+                # Safe defaults — conf calculated later, _skip may be called before that
+                conf_score = 0; conf_label = "LOW"; conf_reasons = []
 
                 def _skip(reason, conf_score=0, conf_label=""):
                     stats["skipped"] += 1
