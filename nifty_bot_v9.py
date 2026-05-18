@@ -2300,10 +2300,23 @@ def run():
 
     while True:
         try:
-            ltp = None   # ✅ ADD THIS
+            # ✅ FETCH DATA FIRST (CRITICAL FIX)
+            ltp    = get_nifty_ltp()
+            df_5   = get_candles(5)
+            df_15  = get_candles(15)
+            df_30  = get_candles(30)
+            fut_df = get_futures_candles(5)
             t   = ist_time()
             now = now_ist()
-            today = now.date()
+            
+            # after df fetch
+            try:
+                ltp = float(df_5["close"].iloc[-1])
+            except Exception as e:
+                log.warning(f"LTP fetch failed: {e}")
+                continue
+            if ltp is None:
+                continue
 
             # Pre-market reminder (9:00 AM)
             if not reminder_sent and REMINDER_TIME <= t < TRADE_START:
@@ -2570,12 +2583,6 @@ def run():
                 if prev_ohlc:
                     log.info("prev_ohlc fetched successfully on retry")
 
-            # Fetch fresh data
-            ltp    = get_nifty_ltp()
-            df_5   = get_candles(5)
-            df_15  = get_candles(15)
-            df_30  = get_candles(30)
-            fut_df = get_futures_candles(5)
             if ltp is None or df_5 is None:
                 time.sleep(15); continue
 
