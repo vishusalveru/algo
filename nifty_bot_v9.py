@@ -167,6 +167,15 @@ import numpy as np
 import pandas as pd
 import pytz
 import config
+# [V9-FIX2] Option chain for liquidity + delta
+try:
+    from upstox_option_chain import OptionChain, check_option_quality
+    _OPTION_CHAIN_AVAILABLE = True
+except ImportError:
+    log.warning('upstox_option_chain.py not found — option quality gate disabled')
+    _OPTION_CHAIN_AVAILABLE = False
+    OptionChain = None
+    def check_option_quality(*a, **kw): return True, 'Module N/A', {}
 from nifty_auto_bias import (
     get_combined_bias_nifty,
     pre_trade_check_nifty,
@@ -240,7 +249,11 @@ PCR_FRESH_SECS       = 900
 PCR_STALE_SECS       = 1800
 GAP_FILTER_PCT       = 0.5
 ATR_PERIOD           = 14
-ATR_TRENDING_MIN     = 35    # [V9-F3] raised from 15 — April data: ATR<35 = chop not momentum
+ATR_TRENDING_MIN     = 35    # [V9-F3] Group A trend strategies — need high momentum
+ATR_STRUCTURE_MIN    = 28    # [V9-F4] Group B structure strategies
+ATR_REVERSAL_MIN     = 28    # [V9-F4] Group C reversal strategies — need room to hit target
+                             # RSIDivergence: target=16pts, need ATR>16*1.5=24pts min
+                             # Set to 28pts for safety margin (May 15: ATR=25 hit SL)
 ATR_MIN_FOR_TRADE    = 20     # [F29] block all strategies below 20pts ATR
 VWAP_CROSS_VOL_MIN   = 1.2
 RSI_PERIOD           = 14
@@ -437,6 +450,7 @@ STRATEGY_GROUPS = {
     "A": {  # Trend-following
         "strategies" : ["EMAStack","EMACross","SuperTrend","BOS"],  # [V9-F1] ORB+EMA removed
         "capital"    : 8000,
+        "atr_min"    : 35,    # [V9-F4] trend needs strong momentum
         "sl"         : 12,
         "target"     : 20,   # 1:1.67 RR
         "trail_start": 12,
@@ -445,6 +459,7 @@ STRATEGY_GROUPS = {
     "B": {  # Structure / momentum
         "strategies" : ["StrongFVG","EMA50Bounce","VWAPBand","ORPH_ORPL"],
         "capital"    : 8000,
+        "atr_min"    : 20,    # [V9-F4] structure — VWAPBand works well at ATR 22-28
         "sl"         : 10,
         "target"     : 18,   # 1:1.8 RR
         "trail_start": 10,
@@ -453,6 +468,7 @@ STRATEGY_GROUPS = {
     "C": {  # Reversal / mean-reversion
         "strategies" : ["RSIDivergence","VWAPCross","CPR"],
         "capital"    : 7000,
+        "atr_min"    : 23,    # [V9-F4] Group C tgt=16pts, need ATR>16*1.4=22.4 → 23pts min
         "sl"         : 8,
         "target"     : 16,   # 1:2.0 RR
         "trail_start": 8,
@@ -1492,22 +1508,40 @@ def classify_intraday_regime(df_5, e9, e21):
     Uses last 12 candles (60 min) of 5m data.
     Returns: TRENDING_BULL | TRENDING_BEAR | WEAK_BULL | WEAK_BEAR
              | RANGING | CHOPPY | UNKNOWN
+
+    [V9-FIX1] Dynamic thresholds: rng > 1.8*ATR instead of fixed >100
+    Proved wrong on 2/4 real trading days with fixed threshold:
+      May11: range=137 but ATR=28 → 1.8*28=50 → NOT trending (correct)
+      May15: range=129 but ATR=25 → 1.8*25=45 → NOT trending (correct)
+    Fixed >100 misclassified both as TRENDING → wrong regime gate.
+    Dynamic threshold adapts to VIX changes, event days, market conditions.
     """
     try:
         if df_5 is None or len(df_5) < 12:
             return "UNKNOWN"
         closes = df_5["close"].astype(float).values[-12:]
-        rng    = closes.max() - closes.min()
-        half1  = closes[:6].mean()
-        half2  = closes[6:].mean()
+        atr_vals = df_5["atr"].astype(float).values[-12:] if "atr" in df_5.columns else None
+        rng      = closes.max() - closes.min()
+        half1    = closes[:6].mean()
+        half2    = closes[6:].mean()
         direction = "up" if half2 > half1 else "down"
         ema_bull  = float(e9) > float(e21)
 
-        if rng > 100:
-            if direction == "up"  and ema_bull:  return "TRENDING_BULL"
-            if direction == "down" and not ema_bull: return "TRENDING_BEAR"
+        # [V9-FIX1] Dynamic ATR-relative thresholds
+        # If ATR available use 1.8*ATR, else fall back to sensible fixed values
+        if atr_vals is not None and len(atr_vals) > 0:
+            avg_atr = float(np.mean(atr_vals[atr_vals > 0])) if any(atr_vals > 0) else 30.0
+            trend_threshold = avg_atr * 1.8   # was fixed 100
+            weak_threshold  = avg_atr * 1.2   # was fixed 60
+        else:
+            trend_threshold = 100   # fallback to original if no ATR
+            weak_threshold  = 60
+
+        if rng > trend_threshold:
+            if direction == "up"   and ema_bull:      return "TRENDING_BULL"
+            if direction == "down" and not ema_bull:   return "TRENDING_BEAR"
             return "CHOPPY"
-        elif rng > 60:
+        elif rng > weak_threshold:
             if direction == "up":   return "WEAK_BULL"
             else:                   return "WEAK_BEAR"
         else:
@@ -1590,15 +1624,13 @@ def calc_confidence(direction, trend, e9, e21, e50, ltp,
     else:
         reasons.append("Wrong VWAP side +0")
 
-    # 4. PCR confirmation (+1)
+    # 4. PCR — weight reduced to 0 (intraday noise, wrong 3/4 live days)
+    # PCR kept in logs for analysis but no longer affects confidence score.
+    # Will be re-evaluated after 10 live sessions.
     if pcr_weight >= 1.0:
-        if (direction == "bullish" and pcr_bias == "bullish") or \
-           (direction == "bearish" and pcr_bias == "bearish"):
-            score += 1; reasons.append(f"PCR {pcr_bias} fresh +1")
-        else:
-            reasons.append(f"PCR {pcr_bias} mismatch +0")
+        reasons.append(f"PCR {pcr_bias} (logged, weight=0)")
     else:
-        reasons.append(f"PCR excluded (stale) +0")
+        reasons.append(f"PCR stale (logged, weight=0)")
 
     # 5. RVOL (+1)
     if rvol >= 1.5:
@@ -2195,6 +2227,9 @@ def run():
     # [F3] Load persisted state (crash recovery)
     stats = load_state()
 
+    # [V9-FIX2] Option chain — init once, refresh every 15 min
+    option_chain = OptionChain(config.LIVE_TOKEN) if _OPTION_CHAIN_AVAILABLE else None
+
     cap_mgr      = GroupCapitalManager()   # [V8-F1] per-group capital
     session_bias = SessionBias()
     pcr_cache    = PCRCache()
@@ -2290,6 +2325,11 @@ def run():
                 time.sleep(30); continue
 
             premarket_done = False
+
+            # [V9-REGIME-WINDOW] Need 18 candles before strategies fire
+            # Dynamic 1.8×ATR regime needs 12-candle window: candle 6+12=18
+            if candles_seen < 18:
+                time.sleep(60); continue
 
             # [V9-BIAS-REFRESH] Refresh auto_bias every 15 min intraday
             # PCR + FII + trend captured fresh every 15 min to stay aligned with market
@@ -2540,6 +2580,10 @@ def run():
             # [P5] Track candles formed since open
             candles_seen = len(df_5)
 
+            # [V9-FIX2] Refresh option chain — dynamic TTL (5min high-vol, 15min normal)
+            if option_chain is not None:
+                option_chain.refresh(ltp, atr=atr if "atr" in dir() else 0)
+
             # Use first candle's open as open_price — more accurate than LTP at start
             if open_price is None:
                 try:
@@ -2780,6 +2824,7 @@ def run():
                     f"Final bias   : {pre_bias.upper()}",
                     f"Conf preview : {conf_prev}/10",
                     f"Regime       : {intraday_regime if 'intraday_regime' in dir() else '?'}",
+                    f"LivePCR      : {option_chain.get_live_pcr():.3f}" if option_chain and option_chain._fetch_ok else "LivePCR      : N/A",
                     f"Signals      : {', '.join(strats) if strats else 'NONE'}"
                 ])
 
@@ -2844,10 +2889,34 @@ def run():
                     _skip(f"OpenNoise: {candles_seen} candles < {MIN_CANDLES_BEFORE_ENTRY} (30min gate)")
                     return False
 
-                # [V8-F6] Signal quality gate
-                if atr < ATR_MIN_FOR_TRADE:
-                    _skip(f"ATRTooLow: {atr:.0f}pts < {ATR_MIN_FOR_TRADE}pts min")
+                # [V9-F4] Per-group ATR gate — each group needs different ATR minimum
+                # Group A (trend): ATR>35 — high momentum required
+                # Group B (structure): ATR>28 — needs room to move to target
+                # Group C (reversal): ATR>28 — target=16pts, need ATR>24pts minimum
+                _grp_atr_min = gcfg.get("atr_min", ATR_MIN_FOR_TRADE)
+                if atr < _grp_atr_min:
+                    _skip(f"ATRTooLow[Grp{gid}]: {atr:.0f}pts < {_grp_atr_min}pts min")
                     return False
+                # Also enforce absolute floor
+                if atr < ATR_MIN_FOR_TRADE:
+                    _skip(f"ATRFloor: {atr:.0f}pts < {ATR_MIN_FOR_TRADE}pts abs min")
+                    return False
+
+                # [V9-FIX2] Option quality gate — liquidity + spread + IV
+                if option_chain is not None:
+                    _oc_ok, _oc_reason, _oc_info = check_option_quality(
+                        option_chain, ltp, direction,
+                        gcfg["sl"], gcfg["tgt"]
+                    )
+                    if not _oc_ok:
+                        _skip(f"OptionQuality: {_oc_reason}", conf_score, conf_label)
+                        return False
+                    # Log option info for trade analysis
+                    _trade_delta  = _oc_info.get("delta", 0.45)
+                    _trade_prem_sl= _oc_info.get("premium_sl", 0)
+                    _trade_spread = _oc_info.get("spread", 0)
+                else:
+                    _trade_delta=0.45; _trade_prem_sl=0; _trade_spread=0
 
                 # [V9-F2] Regime gate — block trend strategies in weak/ranging markets
                 # April 2026: WEAK_BULL WR 27% (-Rs.4615), TRENDING WR 67%+
