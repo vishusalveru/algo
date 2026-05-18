@@ -172,7 +172,7 @@ try:
     from upstox_option_chain import OptionChain, check_option_quality
     _OPTION_CHAIN_AVAILABLE = True
 except ImportError:
-    log.warning('upstox_option_chain.py not found — option quality gate disabled')
+    print('WARNING: upstox_option_chain.py not found — option quality gate disabled')
     _OPTION_CHAIN_AVAILABLE = False
     OptionChain = None
     def check_option_quality(*a, **kw): return True, 'Module N/A', {}
@@ -2211,6 +2211,7 @@ def open_trade(trade_no, strategy, direction, entry_price,
 #  MAIN LOOP
 # ─────────────────────────────────────────────
 def run():
+    ltp = None  # initialise here — Python scopes ltp as local to entire run()
     init_logs()
 
     # [F15] Token health check before anything else
