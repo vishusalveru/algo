@@ -2382,6 +2382,7 @@ def run():
     closed_summary_sent = False
     prev_df5_ema       = None
     prev_ltp           = None
+    ltp                = None   # [V12.1-BUG] always bound; trade-monitor may skip assignment
     india_vix          = None
     vix_alert_sent     = False
     vix_alert_at       = None
@@ -2744,7 +2745,7 @@ def run():
                         "Active trade (if any) continues normally"])
                     vix_alert_sent = True
                     vix_alert_at   = now_ist()
-                prev_ltp = ltp; time.sleep(60); continue
+                prev_ltp = ltp_now or ltp; time.sleep(60); continue
             else:
                 # Reset alert state when VIX comes back down
                 if vix_alert_sent:
