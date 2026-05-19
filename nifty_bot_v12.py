@@ -1,8 +1,8 @@
 """
 =============================================================
-  Nifty 50 Scalping Bot v9 — Regime-Aware + Quality Filter Build
+  Nifty 50 Scalping Bot v12.1 — Signal Scoring + Time-Based Sizing
   ─────────────────────────────────────────────────────────
-  INHERITS : All v5-v8 fixes.
+  INHERITS : All v5-v11 fixes (changelog preserved below).
 
   V9 CHANGES (April 2026 backtest — 20 days, 41 trades proved):
 
@@ -190,7 +190,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
-        logging.FileHandler("nifty_v9.log"),
+        logging.FileHandler("nifty_v12.log"),
         logging.StreamHandler()
     ]
 )
@@ -808,7 +808,7 @@ def send_csv_files():
         (_LOG_FILES.get("skip",  "skip_log_v5.csv"),  "Nifty Skip v8  — all rejected signals"),
     ]
     date_str = datetime.date.today().strftime("%Y-%m-%d")
-    send_telegram(f"📊 <b>Nifty v9 CSVs — {date_str}</b>")
+    send_telegram(f"📊 <b>Nifty v12 CSVs — {date_str}</b>")
     sent = 0
     for fname, caption in files:
         if not os.path.exists(fname): continue
@@ -871,7 +871,7 @@ class TelegramListener:
                         s  = self._stats
                         wr = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
                         send_telegram(
-                            f"📊 <b>Nifty Bot v9 STATUS</b>\n"
+                            f"📊 <b>Nifty Bot v12 STATUS</b>\n"
                             f"  Time       : {now_ist().strftime('%H:%M:%S IST')}\n"
                             f"  Auto bias  : {self._auto_bias.upper()}\n"
                             f"  Session    : {self._sb.bias.upper()}\n"
@@ -2169,9 +2169,9 @@ def get_log_filenames():
     """
     date_str = datetime.date.today().strftime("%Y-%m-%d")
     return {
-        "scan"  : f"scan_log_v9_{date_str}.csv",
-        "trade" : f"trade_log_v9_{date_str}.csv",
-        "skip"  : f"skip_log_v9_{date_str}.csv",
+        "scan"  : f"scan_log_v12_{date_str}.csv",
+        "trade" : f"trade_log_v12_{date_str}.csv",
+        "skip"  : f"skip_log_v12_{date_str}.csv",
     }
 
 # Module-level log file paths — set once at startup
@@ -2409,7 +2409,7 @@ def run():
     vwap_bb = vwap_cx = ema50_b = ema_cx = st_sig = cpr_sig = None
 
     send_telegram(
-        f"🤖 <b>Nifty Bot v9 — Multi-Trade Paper Build</b>\n\n"
+        f"🤖 <b>Nifty Bot v12.1 — Multi-Trade Paper Build</b>\n\n"
         f"  Token check   : ✅ Live (LTP:{startup_ltp:.0f})\n"
         f"  Paper trading : ✅ No real orders\n"
         f"  Multi-trade   : ✅ Up to {MAX_CONCURRENT_GROUPS} groups concurrent\n"
@@ -3196,7 +3196,7 @@ def run():
                 vix_line = f"RSI:{rsi:.0f} ATR:{atr:.0f}pts" + (f" VIX:{india_vix:.2f}" if india_vix else "")
 
                 icon = "✅" if entry_met else "⏸"
-                tg(icon, f"NIFTY v9 SCAN {now.strftime('%H:%M')}", [
+                tg(icon, f"NIFTY v12 SCAN {now.strftime('%H:%M')}", [
                     f"Nifty        : {ltp:.2f} ({chg_pct:+.2f}%)",
                     f"Session bias : {session_bias.bias.upper()} Z:{zscore:+.2f}",
                     vix_line,
@@ -3882,8 +3882,8 @@ if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        log.info("Nifty Bot v9 stopped by user")
-        send_telegram("⏹ Nifty Bot v9 stopped (KeyboardInterrupt)")
+        log.info("Nifty Bot v12 stopped by user")
+        send_telegram("⏹ Nifty Bot v12 stopped (KeyboardInterrupt)")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
-        send_telegram(f"🚨 Nifty Bot v9 CRASHED: {e}")
+        send_telegram(f"🚨 Nifty Bot v12 CRASHED: {e}")
