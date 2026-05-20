@@ -249,13 +249,21 @@ PCR_FRESH_SECS       = 900
 PCR_STALE_SECS       = 1800
 GAP_FILTER_PCT       = 0.5
 ATR_PERIOD           = 14
-ATR_TRENDING_MIN     = 30    # [V10-F1] REDUCED from 35 → 30pts. May 18: ATR 31-35 blocked 90% signals
-                             # 30pts = adequate for 5min scalping, not "too low"
-ATR_STRUCTURE_MIN    = 28    # [V9-F4] Group B structure strategies
-ATR_REVERSAL_MIN     = 28    # [V9-F4] Group C reversal strategies — need room to hit target
-                             # RSIDivergence: target=16pts, need ATR>16*1.5=24pts min
-                             # Set to 28pts for safety margin (May 15: ATR=25 hit SL)
-ATR_MIN_FOR_TRADE    = 20     # [F29] block all strategies below 20pts ATR
+# ─── ATR thresholds — single source of truth [V12.2-REFACTOR] ───
+# Per-group entry gate, applied in try_trade() before any strategy logic.
+# Group A (trend) needs high momentum; B (structure) and C (reversal) less so.
+# These values were inherited from v9-v12 and are kept as-is; tuning belongs to
+# a future evidence-based pass, not this cleanup.
+GROUP_ATR_MIN = {"A": 35, "B": 20, "C": 23}
+ATR_FLOOR     = 18           # Absolute floor below which NO strategy trades.
+                             # Set to 18 (below B's 20) so per-group gates are the
+                             # binding constraint; this is a last-resort safety net.
+ATR_SCORE_TREND_OK  = 32     # signal scorer: trend strats score ATR-OK above this
+ATR_SCORE_OTHER_OK  = 22     # signal scorer: non-trend strats score ATR-OK above this
+ATR_VWAPBAND_MIN    = 30     # VWAPBand detector needs band-worthy volatility
+# Legacy aliases — kept temporarily for any straggler references; remove in v12.3
+ATR_TRENDING_MIN     = ATR_VWAPBAND_MIN
+ATR_MIN_FOR_TRADE    = ATR_FLOOR
 VWAP_CROSS_VOL_MIN   = 1.2
 RSI_PERIOD           = 14
 RSI_OVERBOUGHT       = 65
@@ -451,7 +459,7 @@ STRATEGY_GROUPS = {
     "A": {  # Trend-following
         "strategies" : ["EMAStack","EMACross","SuperTrend","BOS"],  # [V9-F1] ORB+EMA removed
         "capital"    : 8000,
-        "atr_min"    : 35,    # [V9-F4] trend needs strong momentum
+        "atr_min"    : GROUP_ATR_MIN["A"],   # [V12.2-REFACTOR] from unified config
         "sl"         : 12,
         "target"     : 20,   # 1:1.67 RR
         "trail_start": 12,
@@ -460,7 +468,7 @@ STRATEGY_GROUPS = {
     "B": {  # Structure / momentum
         "strategies" : ["StrongFVG","EMA50Bounce","VWAPBand","ORPH_ORPL"],
         "capital"    : 8000,
-        "atr_min"    : 20,    # [V9-F4] structure — VWAPBand works well at ATR 22-28
+        "atr_min"    : GROUP_ATR_MIN["B"],   # [V12.2-REFACTOR] from unified config
         "sl"         : 10,
         "target"     : 18,   # 1:1.8 RR
         "trail_start": 10,
@@ -469,7 +477,7 @@ STRATEGY_GROUPS = {
     "C": {  # Reversal / mean-reversion
         "strategies" : ["RSIDivergence","VWAPCross","CPR"],
         "capital"    : 7000,
-        "atr_min"    : 23,    # [V9-F4] Group C tgt=16pts, need ATR>16*1.4=22.4 → 23pts min
+        "atr_min"    : GROUP_ATR_MIN["C"],   # [V12.2-REFACTOR] from unified config
         "sl"         : 8,
         "target"     : 16,   # 1:2.0 RR
         "trail_start": 8,
@@ -540,6 +548,9 @@ def load_state():
             with open(STATE_FILE) as f:
                 state = json.load(f)
             if state.get("date") == today:
+                # [V12.3-FIX10] Backfill new drawdown keys if loading older state
+                state.setdefault("peak_pnl", state.get("pnl", 0.0))
+                state.setdefault("max_drawdown", 0.0)
                 log.info(f"Resumed state: P&L={state['pnl']} trades={state['trades']} "
                          f"bias={state.get('manual_bias','neutral')}")
                 return state
@@ -556,6 +567,8 @@ def load_state():
         "high_t": 0, "high_w": 0,
         "med_t": 0, "med_w": 0,
         "low_t": 0, "low_w": 0,
+        "peak_pnl": 0.0,           # [V12.3-FIX10] running peak for drawdown tracking
+        "max_drawdown": 0.0,       # worst drawdown from peak this session
         "manual_bias": "neutral"   # persisted /bias command
     }
 
@@ -573,42 +586,9 @@ def save_state(stats, manual_bias="neutral"):
         log.error(f"State save error: {e}")
 
 
-# ─────────────────────────────────────────────
-#  [F10] CAPITAL MANAGER — with recovery logic
-# ─────────────────────────────────────────────
-class CapitalManager:
-    def __init__(self):
-        self.consec_losses = 0
-        self.consec_wins   = 0
-        self.reduced       = False
 
-    def on_result(self, result):
-        """
-        [F18] Unified loss tracking. timeout_duration counts as a loss
-        for capital management because options lose value via theta.
-        """
-        if result == "target":
-            self.consec_losses = 0
-            self.consec_wins  += 1
-            # [F10] Recover full capital after 2 wins in reduced mode
-            if self.reduced and self.consec_wins >= 2:
-                self.reduced = False
-                log.info("Capital restored: 2 wins after reduction")
-        elif result in ["sl", "timeout", "timeout_theta", "timeout_duration"]:
-            # [F18] All loss/timeout types reduce capital eventually
-            self.consec_losses += 1
-            self.consec_wins    = 0
-            if self.consec_losses >= 2:
-                self.reduced = True
-
-    def get_capital(self):
-        return CAPITAL_REDUCED if self.reduced else CAPITAL_PER_TRADE
-
-    def get_info(self):
-        return (f"Rs.{self.get_capital():.0f} "
-                f"{'(REDUCED)' if self.reduced else '(NORMAL)'} "
-                f"[CL:{self.consec_losses} CW:{self.consec_wins}]")
-
+# [V12.2-REFACTOR] Removed unused CapitalManager class here (~37 lines).
+# It was superseded by GroupCapitalManager which is the only one instantiated.
 
 # ─────────────────────────────────────────────
 #  [F1] SESSION BIAS + Z-SCORE
@@ -1287,7 +1267,7 @@ def detect_vwap_band_break(df_vwap, ltp, t5, atr):
         vu1 = float(last["vwap_u1"]); vl1 = float(last["vwap_l1"])
         bw  = float(last.get("band_width", 0))
         pltp = float(prev["close"])
-        if atr < ATR_TRENDING_MIN:
+        if atr < ATR_VWAPBAND_MIN:
             return None, f"ATR {atr:.0f}pts too low"
         if bw < 30:
             return None, f"Bands too narrow {bw:.0f}pts"
@@ -1553,153 +1533,12 @@ def classify_intraday_regime(df_5, e9, e21):
 
 
 
-# ─────────────────────────────────────────────
-#  [V6-F13] DAY TYPE CLASSIFIER
-# ─────────────────────────────────────────────
-def classify_day_type(open_price, prev_ohlc, atr, df_5=None):
-    """
-    Classify the current day type to enable/disable strategies.
-    Returns: 'TRENDING' | 'RANGEBOUND' | 'VOLATILE' | 'GAP_UP' | 'GAP_DOWN'
-    """
-    try:
-        gap_pct = 0.0
-        if prev_ohlc:
-            gap_pct = (open_price - prev_ohlc["close"]) / prev_ohlc["close"] * 100
-        # Gap days
-        if gap_pct > 0.5:  return "GAP_UP",    gap_pct
-        if gap_pct < -0.5: return "GAP_DOWN",  gap_pct
-        # High ATR = volatile
-        if atr > 40:       return "VOLATILE",  gap_pct
-        # Check if price is trending (using 5m candle HH/HL or LL/LH pattern)
-        if df_5 is not None and len(df_5) >= 6:
-            closes = df_5["close"].astype(float).values[-6:]
-            up_moves   = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
-            down_moves = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
-            if up_moves >= 4:   return "TRENDING",    gap_pct
-            if down_moves >= 4: return "TRENDING",    gap_pct
-        return "RANGEBOUND", gap_pct
-    except:
-        return "UNKNOWN", 0.0
 
-
-# ─────────────────────────────────────────────
-#  CONFIDENCE SCORER (0–10, was 0–9)
-# ─────────────────────────────────────────────
-def calc_signal_strength(trend, ema_aligned, vwap_side, rvol, atr, 
-                        pre_bias, strategy_name, is_multi_timeframe=True):
-    """
-    [V11-NEW] Signal Strength Scoring Engine
-    
-    NOT just "trade or not trade", but "HOW STRONG is this signal?"
-    
-    Scores signals on scale 0-10, with multiple conditions:
-    - Trend alignment (most important)
-    - EMA confluence
-    - VWAP confirmation
-    - Volume confirmation
-    - Volatility suitability
-    - Bias alignment
-    
-    Example:
-      score=2: Weak signal (only 1-2 confirmations)
-      score=4: Medium signal (3-4 confirmations)
-      score=7: Strong signal (5-6 confirmations)
-      score=9: Very strong signal (6+ confirmations + perfect setup)
-    """
-    
-    score = 0
-    reasons = []
-    
-    # 1. TREND ALIGNMENT (0-3 pts) — Most important
-    if trend == strategy_name.lower() or (trend == "bullish" and "bull" in strategy_name.lower()):
-        if is_multi_timeframe:
-            score += 3  # Multi-TF confirmed = strong
-            reasons.append("MultiTF trend +3")
-        else:
-            score += 2  # Single TF trend
-            reasons.append("Trend aligned +2")
-    elif trend == "neutral":
-        score += 1  # At least not against us
-        reasons.append("Trend neutral +1")
-    else:
-        reasons.append("Trend mismatch +0")
-    
-    # 2. EMA CONFLUENCE (0-2 pts)
-    if ema_aligned:
-        score += 2
-        reasons.append("EMA aligned +2")
-    else:
-        reasons.append("EMA mismatch +0")
-    
-    # 3. VWAP CONFIRMATION (0-1 pt)
-    if vwap_side:
-        score += 1
-        reasons.append("VWAP confirm +1")
-    else:
-        reasons.append("VWAP against +0")
-    
-    # 4. VOLUME CONFIRMATION (0-2 pts)
-    if rvol >= 2.0:
-        score += 2  # Strong volume
-        reasons.append(f"RVOL {rvol}x strong +2")
-    elif rvol >= 1.5:
-        score += 1  # Moderate volume
-        reasons.append(f"RVOL {rvol}x +1")
-    else:
-        reasons.append(f"RVOL {rvol}x weak +0")
-    
-    # 5. VOLATILITY SUITABILITY (0-1 pt)
-    # Different strategies need different ATR ranges
-    trend_strategies = ["ema_stack", "bos", "ema_cross"]
-    if strategy_name.lower() in trend_strategies:
-        atr_min = 35
-    else:
-        atr_min = 25
-    
-    if atr >= atr_min:
-        score += 1
-        reasons.append(f"ATR {atr} suitable +1")
-    else:
-        reasons.append(f"ATR {atr} low +0")
-    
-    # 6. BIAS ALIGNMENT (0-1 pt)
-    if pre_bias == "neutral" or pre_bias == "unknown":
-        score += 1  # No headwind
-        reasons.append("Bias neutral +1")
-    else:
-        reasons.append(f"Bias {pre_bias} +0")
-    
-    # Convert to 0-10 scale
-    signal_strength = min(score, 10)
-    
-    if signal_strength >= 8:
-        strength_label = "STRONG"
-    elif signal_strength >= 6:
-        strength_label = "GOOD"
-    elif signal_strength >= 4:
-        strength_label = "MEDIUM"
-    else:
-        strength_label = "WEAK"
-    
-    return signal_strength, strength_label, reasons
-
-
-def init_market_regime_memory():
-    """
-    [V11-NEW] Market Regime Memory
-    
-    Track: Last N trades in current regime
-    Purpose: Detect choppy markets, reduce aggression
-    
-    Example: If last 3 trades all hit SL in CHOPPY regime,
-    skip next 2 trades in that regime
-    """
-    return {
-        "last_trades": [],  # [(timestamp, regime, result), ...]
-        "regime_stats": {},  # {regime: {'wins': N, 'losses': N, 'streak': int}}
-        "max_memory": 10,   # Remember last 10 trades
-    }
-
+# [V12.2-REFACTOR] Removed 3 unused functions here:
+#   - classify_day_type (never called)
+#   - calc_signal_strength (module-level; superseded by inline score_signal in run())
+#   - init_market_regime_memory (never called; chop detection now uses recent_trade_results)
+# Saved ~140 lines. See git history if needed.
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -2579,6 +2418,15 @@ def run():
                         icon = "⏰ TIME"; stats["timeouts"] += 1; stats["consec_loss"] += 1
                     stats["trades"] += 1
                     stats["pnl"]    = round(stats["pnl"] + pnl, 0)
+                    # [V12.3-FIX10] Track running peak and max drawdown from peak
+                    if stats["pnl"] > stats.get("peak_pnl", 0):
+                        stats["peak_pnl"] = stats["pnl"]
+                    _current_dd = stats.get("peak_pnl", 0) - stats["pnl"]
+                    if _current_dd > stats.get("max_drawdown", 0):
+                        stats["max_drawdown"] = round(_current_dd, 0)
+                        if _current_dd >= 2000:  # alert on meaningful drawdowns
+                            log.warning(f"[Drawdown] New max DD: ₹{_current_dd:.0f} "
+                                        f"(peak:{stats['peak_pnl']:.0f} → now:{stats['pnl']:.0f})")
                     cl = active_trade.conf_label
                     if   cl == "HIGH":   stats["high_t"] += 1; stats["high_w"] += (1 if result=="target" else 0)
                     elif cl == "MEDIUM": stats["med_t"]  += 1; stats["med_w"]  += (1 if result=="target" else 0)
@@ -2728,6 +2576,11 @@ def run():
                     open_price = float(df_5["open"].iloc[0])
                 except Exception:
                     open_price = ltp
+                # [V12.3-FIX7] Initialize prev_ltp from open_price so CPR works first cycle.
+                # Previously prev_ltp was None until end of first loop, making CPR's
+                # `prev_ltp < tc` check return False for one full cycle.
+                if prev_ltp is None:
+                    prev_ltp = open_price
 
             # [F12] VIX spike guard
             india_vix = get_india_vix()
@@ -2795,7 +2648,8 @@ def run():
             # [V12.1-FIX] CHOP DETECTION — read CLOSED trades, not currently-open ones
             # v12 read active_trades.values() which holds only open trades (closed → None).
             # Now: check last 3 closed-trade results from recent_trade_results.
-            last_results = recent_trade_results[-3:] if len(recent_trade_results) >= 2 else []
+            # [V12.3-FIX5] Slicing handles short lists gracefully — no need for length check.
+            last_results = recent_trade_results[-3:]
             sl_hit_count = sum(1 for r in last_results if r == "sl")
             if sl_hit_count >= 2:
                 chop_detected = True
@@ -2868,6 +2722,11 @@ def run():
             t30, _, _ = detect_trend_relaxed(df_30)
             rvol      = calc_rvol(df_5, fut_df)
 
+            # [V12.2-REFACTOR] Compute regime once per loop iteration.
+            # Previously called twice: once in scan-log block, once inside every try_trade().
+            # On a scan tick with N firing strategies, that was 1 + N calls. Now: 1.
+            intraday_regime = classify_intraday_regime(df_5, e9, e21)
+
             df5_vwap = calc_vwap_bands(df_5, atr)
             lr   = df5_vwap.iloc[-1]
             vwap = round(float(lr["vwap"]), 1)
@@ -2892,6 +2751,26 @@ def run():
             st_sig,  st_r      = detect_supertrend_signal(df_5, trend, ltp, atr)
             cpr_sig, cpr_r     = detect_cpr_signal(ltp, cpr_pivot, cpr_bc, cpr_tc,
                                                     trend, prev_ltp if prev_ltp else ltp)
+            # [V12.3-FIX3] Detect BOS, ORPH_ORPL, RSIDivergence here so they can be SCORED
+            # alongside the others. Previously they were detected only at dispatch time and
+            # bypassed the scoring engine entirely.
+            bos_sig, bos_r     = detect_bos(df_5, ltp)
+            # chg_pct (gap %) needed by ORPH/ORPL — compute now (used to be only in scan block)
+            _chg_pct = round((ltp - open_price) / open_price * 100, 2) if open_price else 0.0
+            orph_sig, orph_r   = detect_orph_orpl(ltp, prev_ohlc, trend, prev_ltp, gap_pct=_chg_pct)
+            # RSI divergence — needs an RSI series, build once here
+            try:
+                rsi_series_full = None
+                if df_5 is not None and len(df_5) >= RSI_DIV_LOOKBACK + 2:
+                    _delta  = df_5["close"].astype(float).diff()
+                    _gain   = _delta.clip(lower=0).rolling(RSI_PERIOD).mean()
+                    _loss   = (-_delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
+                    _rs     = _gain / _loss.replace(0, np.nan)
+                    _rsi_full = (100 - (100 / (1 + _rs))).values
+                    rsi_series_full = _rsi_full[-RSI_DIV_LOOKBACK:]
+            except Exception:
+                rsi_series_full = None
+            rsi_div_sig, rsi_div_r = detect_rsi_divergence(df_5, rsi_series_full)
             prev_df5_ema = df5_ema.copy()
 
             # [V12-CRITICAL] SIGNAL SCORING ENGINE
@@ -2954,12 +2833,12 @@ def run():
                 else:
                     reasons.append(f"RVOL {rvol_val:.1f}x weak +0")
                 
-                # 5. VOLATILITY SUITABILITY (0-1 pt)
-                # Trend strats need higher ATR, reversal OK with lower
-                if "Stack" in sig_name or "BOS" in sig_name or "SuperTrend" in sig_name:
-                    atr_min = 32
+                # 5. VOLATILITY SUITABILITY (0-1 pt) [V12.2-REFACTOR: use unified constants]
+                # Trend strats need higher ATR, others OK with lower
+                if sig_name in TREND_STRATEGIES:   # full set: EMAStack, EMACross, SuperTrend, BOS
+                    atr_min = ATR_SCORE_TREND_OK
                 else:
-                    atr_min = 22
+                    atr_min = ATR_SCORE_OTHER_OK
                 
                 if atr_val >= atr_min:
                     score += 1
@@ -3071,6 +2950,34 @@ def run():
                 )
                 signal_scores["CPR"] = (sig_score, sig_strength, sig_reason)
             
+            # [V12.3-FIX3] Score BOS, ORPH_ORPL, RSIDivergence too — previously bypassed scoring
+            if bos_sig:
+                sig_score, sig_strength, sig_reason = score_signal(
+                    bos_sig, "BOS", bos_sig["type"], trend,
+                    (e9 > e21) if bos_sig["type"] == "bullish" else (e9 < e21),
+                    (ltp > vwap) if bos_sig["type"] == "bullish" else (ltp < vwap),
+                    rvol, atr, pre_bias
+                )
+                signal_scores["BOS"] = (sig_score, sig_strength, sig_reason)
+
+            if orph_sig:
+                sig_score, sig_strength, sig_reason = score_signal(
+                    orph_sig, "ORPH_ORPL", orph_sig["type"], trend,
+                    (e9 > e21) if orph_sig["type"] == "bullish" else (e9 < e21),
+                    (ltp > vwap) if orph_sig["type"] == "bullish" else (ltp < vwap),
+                    rvol, atr, pre_bias
+                )
+                signal_scores["ORPH_ORPL"] = (sig_score, sig_strength, sig_reason)
+
+            if rsi_div_sig:
+                sig_score, sig_strength, sig_reason = score_signal(
+                    rsi_div_sig, "RSIDivergence", rsi_div_sig["type"], trend,
+                    (e9 > e21) if rsi_div_sig["type"] == "bullish" else (e9 < e21),
+                    (ltp > vwap) if rsi_div_sig["type"] == "bullish" else (ltp < vwap),
+                    rvol, atr, pre_bias
+                )
+                signal_scores["RSIDivergence"] = (sig_score, sig_strength, sig_reason)
+            
             # [V12-CRITICAL] FILTER by signal strength BEFORE processing
             tradable_signals = {
                 name: (score, strength) 
@@ -3125,8 +3032,8 @@ def run():
                         rsi
                     )
 
-                # [V9-F2] Classify regime for this scan
-                intraday_regime = classify_intraday_regime(df_5, e9, e21)
+                # [V9-F2] Regime for this scan — computed once per loop, see above
+                # (intraday_regime already set)
 
                 write_scan({
                     "datetime": now.strftime("%Y-%m-%d %H:%M IST"),
@@ -3273,8 +3180,10 @@ def run():
                 # for the current trading period (and chop adjustment).
                 _sig_entry = tradable_signals.get(strategy_name)
                 if _sig_entry is None:
-                    # Either no score computed (strategy outside scoring set, e.g. BOS/ORPH/RSIDiv)
-                    # or score < min_confidence_override
+                    # Score below min_confidence_override threshold for current period.
+                    # [V12.3-FIX3] All 12 strategies are now scored (BOS/ORPH/RSIDiv added).
+                    # Fall-through is only used if signal_scores somehow lacks this strategy
+                    # (defensive — shouldn't happen with current code).
                     _raw = signal_scores.get(strategy_name)
                     if _raw is not None:
                         _raw_score, _raw_strength, _ = _raw
@@ -3282,8 +3191,8 @@ def run():
                               f"< min {min_confidence_override} [{trading_period}"
                               f"{',CHOP' if chop_detected else ''}]")
                         return False
-                    # If strategy isn't in signal_scores at all (BOS/ORPH/RSIDivergence),
-                    # fall through to legacy gates — those have their own confidence check.
+                    # Strategy not in signal_scores — let it through to legacy gates
+                    # (defensive fall-through; with v12.3 all strategies are scored)
 
                 # [V7-F16] Signal dedup cooldown — 15 mins per strategy+direction
                 cooldown_key  = f"{strategy_name}_{direction}"
@@ -3318,18 +3227,14 @@ def run():
                     _skip(f"OpenNoise: {candles_seen} candles < {MIN_CANDLES_BEFORE_ENTRY} (30min gate)")
                     return False
 
-                # [V9-F4] Per-group ATR gate — each group needs different ATR minimum
-                # Group A (trend): ATR>35 — high momentum required
-                # Group B (structure): ATR>28 — needs room to move to target
-                # Group C (reversal): ATR>28 — target=16pts, need ATR>24pts minimum
-                _grp_atr_min = gcfg.get("atr_min", ATR_MIN_FOR_TRADE)
+                # [V12.2-REFACTOR] Per-group ATR gate — single source of truth in GROUP_ATR_MIN
+                # Group A (trend) = 35, Group B (structure) = 20, Group C (reversal) = 23
+                _grp_atr_min = gcfg.get("atr_min", ATR_FLOOR)
                 if atr < _grp_atr_min:
                     _skip(f"ATRTooLow[Grp{gid}]: {atr:.0f}pts < {_grp_atr_min}pts min")
                     return False
-                # Also enforce absolute floor
-                if atr < ATR_MIN_FOR_TRADE:
-                    _skip(f"ATRFloor: {atr:.0f}pts < {ATR_MIN_FOR_TRADE}pts abs min")
-                    return False
+                # Note: the old absolute-floor check here was unreachable (every group's
+                # atr_min is already ≥ ATR_FLOOR). Removed in v12.2.
 
                 # [V10.1-FIX3] CRITICAL: Option-aware entry logic (NOT just index dependent)
                 # This is the core difference between paper trading (index) and live trading (options)
@@ -3404,16 +3309,15 @@ def run():
 
                 # [V9-F2] Regime gate — block trend strategies in weak/ranging markets
                 # April 2026: WEAK_BULL WR 27% (-Rs.4615), TRENDING WR 67%+
-                _regime = classify_intraday_regime(df_5, e9, e21)
+                # [V12.2-REFACTOR] use cached intraday_regime from outer scope (computed once per loop)
+                _regime = intraday_regime
                 if strategy_name in TREND_STRATEGIES and _regime in REGIME_BLOCK_TREND:
                     _skip(f"RegimeBlock: {_regime} — trend strat blocked in non-trending market")
                     return False
 
-                # [V9-F3] ATR momentum filter for trend strategies
-                # April 2026: crash days ATR 50-70 → WR 100%, drift days ATR 25-35 → WR 29%
-                if strategy_name in TREND_STRATEGIES and atr < ATR_TRENDING_MIN:
-                    _skip(f"ATRTrend: {atr:.0f}pts < {ATR_TRENDING_MIN}pts (no momentum for trend trade)")
-                    return False
+                # [V12.2-REFACTOR] Removed unreachable [V9-F3] ATRTrend gate here.
+                # TREND_STRATEGIES are all in Group A, which already requires atr ≥ 35.
+                # Since ATR_VWAPBAND_MIN (30) < 35, this check could never fire. Removed.
 
                 # [V8-F3b] CONF CALCULATED FIRST — before any gate
                 # v7 bug: RSI/session blocks fired before conf, producing conf=0 in logs
@@ -3558,172 +3462,11 @@ def run():
                     signal_cooldown[cooldown_key] = time.time()
                     return True
 
-                # [F11] Unified strategy tracker check
-                allowed_entry, tracker_reason = strat_tracker.can_trade(strategy_name, 0)
-                if not allowed_entry:
-                    log.info(f"{strategy_name} blocked by tracker: {tracker_reason}")
-                    _skip(f"StratTracker: {tracker_reason}")
-                    return False
 
-            # ── RUN ALL 12 STRATEGIES ────────────────────────────────────
-
-                # ── [V7-F1] PER-STRATEGY VALIDATION ─────────────────────────
-                # Load this strategy's specific rules (fallback to defaults)
-                srules = PER_STRATEGY_RULES.get(strategy_name, DEFAULT_STRATEGY_RULES)
-
-                # [V7-F2] Per-strategy RSI gate (replaces global RSI block)
-                if direction == "bearish" and rsi < srules["rsi_short_min"]:
-                    log.info(f"{strategy_name} RSI {rsi:.0f} oversold — SHORT blocked "
-                             f"(rule:{srules['rsi_short_min']})")
-                    _skip(f"RSIBlock[{strategy_name}]: SHORT @ RSI {rsi:.0f} "
-                          f"< {srules['rsi_short_min']}")
-                    return False
-                if direction == "bullish" and rsi > srules["rsi_long_max"]:
-                    log.info(f"{strategy_name} RSI {rsi:.0f} overbought — LONG blocked "
-                             f"(rule:{srules['rsi_long_max']})")
-                    _skip(f"RSIBlock[{strategy_name}]: LONG @ RSI {rsi:.0f} "
-                          f"> {srules['rsi_long_max']}")
-                    return False
-
-                # [V7-F14] Session bias vs auto_bias conflict resolution
-                # For strategies with session_bias_over_auto=True:
-                #   if session=bullish and dir=bullish → allow even if auto_bias=bearish
-                effective_bias = pre_bias
-                if srules.get("session_bias_over_auto") and session_bias.is_set:
-                    if session_bias.bias == direction:
-                        effective_bias = direction   # session wins
-                        log.info(f"{strategy_name} session_bias({session_bias.bias}) "
-                                 f"overrides auto_bias({pre_bias}) → allow {direction}")
-
-                # [V7] Session counter-trend check (per-strategy)
-                if srules.get("allow_counter_trend"):
-                    # Strategy explicitly allows counter-trend — skip session block
-                    sess_ok, zs, sess_reason = True, session_bias.get_zscore(ltp), "CT strategy — allowed"
-                else:
-                    sess_ok, zs, sess_reason = session_bias.trade_allowed(direction, ltp, rsi)
-                    if not sess_ok:
-                        log.info(f"{strategy_name} session blocked: {sess_reason}")
-                        _skip(f"Session: {sess_reason}")
-                        return False
-
-                # [F29] CSV-DRIVEN PATCH: Block all trades when ATR is too low.
-                # 2026-05-08: avg ATR 18pts, both trades stopped out. Options
-                # need volatility to move. Below 20pts ATR, theta decay > price
-                # movement potential.
-                if atr < ATR_MIN_FOR_TRADE:
-                    log.info(f"{strategy_name} ATR {atr:.0f} < {ATR_MIN_FOR_TRADE} — dead volatility")
-                    _skip(f"ATRTooLow: {atr:.0f}pts < {ATR_MIN_FOR_TRADE}pts min")
-                    return False
-
-                # [V6-F7] Market condition re-check at signal time (not cached from scan start)
-                # conf_score computed fresh here with live ltp/rsi/ema values
-                conf_score, conf_label, conf_reasons = calc_confidence(
-                    direction, trend, e9, e21, e50, ltp,
-                    vwap, pcr_b, pcr_weight, rvol, pre_bias, t5, t15, t30,
-                    rsi
-                )
-
-                # [V6-F15] PERFECT CONF alert — 10/10 always gets Telegram notification
-                if conf_score >= PERFECT_CONF:
-                    send_telegram(
-                        f"🔥 <b>PERFECT 10/10 SIGNAL — {strategy_name}</b>\n"
-                        f"  Direction: {direction.upper()}\n"
-                        f"  {signal_text}\n"
-                        f"  RSI:{rsi:.0f} RVOL:{rvol}x ATR:{atr:.0f}\n"
-                        f"  All filters GREEN — executing trade"
-                    )
-
-                # [F11] Re-check with actual conf score
-                allowed_entry2, tracker_reason2 = strat_tracker.can_trade(strategy_name, conf_score)
-                if not allowed_entry2:
-                    log.info(f"{strategy_name} re-entry blocked: {tracker_reason2}")
-                    _skip(f"ReEntry: {tracker_reason2}", conf_score, conf_label)
-                    return False
-
-                # [V7] Per-strategy min_conf override
-                strat_min_conf = srules.get("min_conf", MIN_CONF.get(strategy_name, 4))
-                if conf_score < strat_min_conf:
-                    log.info(f"{strategy_name} conf {conf_score}<{strat_min_conf} skip")
-                    _skip(f"LowConf: {conf_score}<{strat_min_conf} min", conf_score, conf_label)
-                    return False
-
-                # [V7] Pre-bias gate — skip entirely if strategy says bias_mismatch_ok
-                # or if effective_bias (after session override) matches direction
-                if not srules.get("bias_mismatch_ok"):
-                    if effective_bias != "neutral" and effective_bias != direction:
-                        rsi_extreme = (direction == "bullish" and rsi < RSI_MEAN_REV_OS) or \
-                                      (direction == "bearish" and rsi > RSI_MEAN_REV_OB)
-                        if abs(zs) < ZSCORE_THRESHOLD or not rsi_extreme:
-                            log.info(f"{strategy_name} bias mismatch: "
-                                     f"effective_bias={effective_bias} dir={direction} "
-                                     f"Z={zs:.2f} RSI={rsi:.0f}")
-                            _skip(f"BiasMismatch: pre_bias={effective_bias} dir={direction} "
-                                  f"Z={zs:.2f} RSI={rsi:.0f}",
-                                  conf_score, conf_label)
-                            return False
-
-                # Reversal risk pre-trade check
-                # Counter-trend strategies bypass this — conflicting bias IS their signal
-                if strategy_name not in ("RSIDivergence", "VWAPCross", "CPR", "StrongFVG"):
-                    proceed, risk, summary, rev_sigs = pre_trade_check_nifty(
-                        df_5, df_15, direction, pre_bias,
-                        prev_ohlc["close"] if prev_ohlc else None, prev_ohlc
-                    )
-                    send_telegram(format_reversal_alert_nifty(
-                        risk, proceed, rev_sigs, summary, strategy_name, direction
-                    ))
-                    if not proceed:
-                        _skip(f"RevRisk: {summary[:60]}", conf_score, conf_label)
-                        return False
-                else:
-                    risk = "LOW"  # counter-trend — skip reversal check
-
-                capital = cap_mgr.get_capital(gid)
-                # [V12.1-FIX] Apply position_multiplier (see first site for rationale)
-                _pm = max(0.3, min(2.0, position_multiplier))
-                capital = round(capital * _pm / 100) * 100
-                log.info(f"[PosSize] {strategy_name} Grp{gid}: base={cap_mgr.get_capital(gid)} "
-                         f"× {_pm:.2f}x = {capital} [{trading_period}]")
-
-                if retest_zone:
-                    bottom, top = retest_zone
-                    # [F2] Start async retest — non-blocking
-                    pending_trade_args = {
-                        "strategy": strategy_name, "direction": direction,
-                        "is_strong": is_strong, "signal": signal_text,
-                        "stat_key": stat_key, "bottom": bottom, "top": top,
-                        "rvol": rvol, "trend_strength": trend_strength,
-                        "risk": risk, "conf_score": conf_score,
-                        "conf_label": conf_label, "conf_reasons": conf_reasons,
-                        "zscore": zs, "rsi": rsi, "atr": atr,
-                        "vwap": vwap, "prev_vwap": prev_vwap,
-                        "e9": e9, "e21": e21, "e50": e50, "capital": capital,
-                        "auto_bias_report": dict(auto_bias_report)
-                    }
-                    retest_waiter.start(bottom, top)
-                    # [V7-F16] Stamp cooldown
-                    signal_cooldown[cooldown_key] = time.time()
-                    return True  # pending
-                else:
-                    ep = get_nifty_ltp()
-                    if ep is None: return False
-                    trade_no += 1
-                    active_trades[gid] = open_trade(
-                        trade_no, strategy_name, direction, ep,
-                        pcr_cache, tg_listener, pre_bias, is_strong,
-                        f"{signal_text} | {conf_label}({conf_score}/10) | "
-                        f"Grp:{gid} Sess:{session_bias.bias} Z:{zs:+.2f} RSI:{rsi:.0f}",
-                        rvol, trend_strength, risk,
-                        conf_score, conf_label, conf_reasons,
-                        session_bias, zs, rsi, atr,
-                        vwap, prev_vwap, e9, e21, e50, capital,
-                        auto_bias_report
-                    )
-                    stats[stat_key] += 1
-                    # [V7-F16] Stamp cooldown
-                    signal_cooldown[cooldown_key] = time.time()
-                    return True
-
+                # [V12.3-FIX1] Dead duplicate validation block removed here (~160 lines).
+                # Both retest and synchronous branches above already return — the second
+                # pipeline (strat_tracker check, RSI gate, session, conf, etc.) was a stale
+                # copy that was unreachable. Active validation runs at lines ~3265-3300.
             # ── RUN ALL 12 STRATEGIES ────────────────────────────────────
 
             # 1. Strong FVG — fresh + gap intact, retest at edge (async)
@@ -3791,36 +3534,21 @@ def run():
                              "cpr"):
                     prev_ltp = ltp; time.sleep(15); continue
 
-            # 10. [V6-F8] BOS — Break of Structure
-            bos_sig, bos_r = detect_bos(df_5, ltp)
+            # 10. [V6-F8] BOS — Break of Structure (detected up top with other signals)
             if bos_sig and not pending_trade_args:
                 if try_trade("BOS", bos_sig["type"], True,
                              f"BOS {bos_r}",
                              "bos"):
                     prev_ltp = ltp; time.sleep(15); continue
 
-            # 11. [V6-F9] ORPH/ORPL — Previous High/Low breakout on gap days
-            orph_sig, orph_r = detect_orph_orpl(ltp, prev_ohlc, trend, prev_ltp, gap_pct=chg_pct)
+            # 11. [V6-F9] ORPH/ORPL — Previous High/Low breakout on gap days (detected up top)
             if orph_sig and not pending_trade_args:
                 if try_trade("ORPH_ORPL", orph_sig["type"], False,
                              f"ORPH_ORPL {orph_r}",
                              "orph_orpl"):
                     prev_ltp = ltp; time.sleep(15); continue
 
-            # 12. [V6-F10] RSI Divergence — early reversal
-            # Build RSI series from df_5 for divergence check
-            try:
-                rsi_series_full = None
-                if df_5 is not None and len(df_5) >= RSI_DIV_LOOKBACK + 2:
-                    delta  = df_5["close"].astype(float).diff()
-                    gain   = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
-                    loss   = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
-                    rs     = gain / loss.replace(0, np.nan)
-                    rsi_full = (100 - (100 / (1 + rs))).values
-                    rsi_series_full = rsi_full[-RSI_DIV_LOOKBACK:]
-            except: rsi_series_full = None
-
-            rsi_div_sig, rsi_div_r = detect_rsi_divergence(df_5, rsi_series_full)
+            # 12. [V6-F10] RSI Divergence — early reversal (detected up top)
             if rsi_div_sig and not pending_trade_args:
                 if try_trade("RSIDivergence", rsi_div_sig["type"], False,
                              f"RSI Div {rsi_div_r}",
@@ -3838,10 +3566,25 @@ def run():
                 _trades_count = stats.get("trades", 0)
                 log.info(
                     f"🟢 HEARTBEAT | Active:{_active_count} | Trades:{_trades_count} | "
-                    f"P&L:₹{_daily_pnl:+.0f} | Errors:{loop_error_count} | "
-                    f"Time:{now.strftime('%H:%M IST')}"
+                    f"P&L:₹{_daily_pnl:+.0f} | Peak:₹{stats.get('peak_pnl', 0):+.0f} | "
+                    f"DD:₹{stats.get('max_drawdown', 0):.0f} | "
+                    f"Errors:{loop_error_count} | Time:{now.strftime('%H:%M IST')}"
                 )
                 last_heartbeat = _now_time
+
+                # [V12.3-FIX6] Prune stale signal_history and signal_cooldown entries.
+                # Both dicts grow over the session (one entry per strategy×price-band).
+                # Anything older than 30 min is no longer relevant for dedup decisions.
+                _PRUNE_AGE_SEC = 1800
+                _before_h = len(signal_history)
+                _before_c = len(signal_cooldown)
+                signal_history = {k: v for k, v in signal_history.items()
+                                  if _now_time - v < _PRUNE_AGE_SEC}
+                signal_cooldown = {k: v for k, v in signal_cooldown.items()
+                                   if _now_time - v < _PRUNE_AGE_SEC}
+                if (_before_h - len(signal_history)) + (_before_c - len(signal_cooldown)) > 0:
+                    log.info(f"[Prune] signal_history {_before_h}→{len(signal_history)}, "
+                             f"signal_cooldown {_before_c}→{len(signal_cooldown)}")
 
         except KeyboardInterrupt:
             raise
