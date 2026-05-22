@@ -1,7 +1,8 @@
 """
 =============================================================
-  Nifty 50 Scalping Bot v12.1 — Signal Scoring + Time-Based Sizing
+  Nifty 50 Scalping Bot v12 — Signal Scoring + Time-Based Sizing
   ─────────────────────────────────────────────────────────
+  Runtime version label is controlled by BOT_VERSION constant.
   INHERITS : All v5-v11 fixes (changelog preserved below).
 
   V9 CHANGES (April 2026 backtest — 20 days, 41 trades proved):
@@ -184,13 +185,21 @@ from nifty_auto_bias import (
 )
 
 # ─────────────────────────────────────────────
+#  VERSION — single source of truth [V12.5]
+#  Change this ONE value to relabel every telegram alert, log line,
+#  status banner, summary header, and CSV filename. Never hardcode a
+#  version string anywhere else.
+# ─────────────────────────────────────────────
+BOT_VERSION = "v12"
+
+# ─────────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
-        logging.FileHandler("nifty_v12.log"),
+        logging.FileHandler(f"nifty_{BOT_VERSION}.log"),
         logging.StreamHandler()
     ]
 )
@@ -447,10 +456,8 @@ DEFAULT_STRATEGY_RULES = {
     "min_conf"              : 5,
 }
 
-# CSV log file names (v8)
-SCAN_LOG_FILE  = f"scan_log_v8_{datetime.date.today()}.csv"
-TRADE_LOG_FILE = f"trade_log_v8_{datetime.date.today()}.csv"
-SKIP_LOG_FILE  = f"skip_log_v8_{datetime.date.today()}.csv"
+# [V12.5] Removed dead SCAN_LOG_FILE/TRADE_LOG_FILE/SKIP_LOG_FILE constants.
+# They were never read — get_log_filenames() is the real path source.
 
 # ─────────────────────────────────────────────
 #  [V8-F1] STRATEGY GROUPS — multi-trade config
@@ -783,12 +790,12 @@ def tg(icon, title, lines):
 
 def send_csv_files():
     files = [
-        (_LOG_FILES.get("scan",  "scan_log_v5.csv"),  "Nifty Scan v8  — 5min market snapshots"),
-        (_LOG_FILES.get("trade", "trade_log_v5.csv"), "Nifty Trade v8 — all completed trades"),
-        (_LOG_FILES.get("skip",  "skip_log_v5.csv"),  "Nifty Skip v8  — all rejected signals"),
+        (_LOG_FILES.get("scan",  "scan_log.csv"),  f"Nifty Scan {BOT_VERSION}  — 5min market snapshots"),
+        (_LOG_FILES.get("trade", "trade_log.csv"), f"Nifty Trade {BOT_VERSION} — all completed trades"),
+        (_LOG_FILES.get("skip",  "skip_log.csv"),  f"Nifty Skip {BOT_VERSION}  — all rejected signals"),
     ]
     date_str = datetime.date.today().strftime("%Y-%m-%d")
-    send_telegram(f"📊 <b>Nifty v12 CSVs — {date_str}</b>")
+    send_telegram(f"📊 <b>Nifty {BOT_VERSION} CSVs — {date_str}</b>")
     sent = 0
     for fname, caption in files:
         if not os.path.exists(fname): continue
@@ -841,7 +848,7 @@ class TelegramListener:
                         # [V8-NO-MANUAL-BIAS] Manual bias removed.
                         # Bot runs fully on auto-bias (PCR + FII + gap + trend).
                         send_telegram(
-                            "ℹ️ <b>Manual bias removed in v8</b>\n"
+                            f"ℹ️ <b>Manual bias removed in {BOT_VERSION}</b>\n"
                             "  Bot runs on auto-bias only:\n"
                             f"  Auto bias  : {self._auto_bias.upper()}\n"
                             f"  Session    : {self._sb.bias.upper()}\n"
@@ -851,7 +858,7 @@ class TelegramListener:
                         s  = self._stats
                         wr = (s["wins"] / s["trades"] * 100) if s["trades"] > 0 else 0
                         send_telegram(
-                            f"📊 <b>Nifty Bot v12 STATUS</b>\n"
+                            f"📊 <b>Nifty Bot {BOT_VERSION} STATUS</b>\n"
                             f"  Time       : {now_ist().strftime('%H:%M:%S IST')}\n"
                             f"  Auto bias  : {self._auto_bias.upper()}\n"
                             f"  Session    : {self._sb.bias.upper()}\n"
@@ -1482,6 +1489,11 @@ REGIME_TRENDING  = {"TRENDING_BULL", "TRENDING_BEAR"}
 REGIME_BLOCK_TREND = {"WEAK_BULL", "WEAK_BEAR", "CHOPPY", "RANGING", "UNKNOWN"}
 # [V9] Trend strategies blocked in these regimes:
 TREND_STRATEGIES = {"EMAStack", "EMACross", "SuperTrend", "BOS"}
+# [V12.4-FIX1] Counter-trend strategies need different scoring threshold.
+# The scoring engine penalises trend/EMA/VWAP conflicts (-6 max), which is correct
+# for trend strategies but unfair to mean-reversion strategies whose ENTIRE PURPOSE
+# is to fade extreme moves. Cap their effective threshold at 3 regardless of period.
+COUNTER_TREND_STRATEGIES = {"RSIDivergence", "VWAPCross"}
 
 def classify_intraday_regime(df_5, e9, e21):
     """
@@ -1935,6 +1947,7 @@ SCAN_COLS = [
     "cpr_pivot", "cpr_tc", "cpr_bc", "cpr_signal",
     "pcr", "pcr_bias", "pcr_status",
     "manual_bias", "auto_bias", "final_bias",
+    "bias_trend_agree",
     "auto_bias_score", "auto_bias_conf",
     "pcr_source_bias", "vix_bias", "gift_nifty_bias", "news_bias",
     "pdh", "pdl", "pdc",
@@ -2008,9 +2021,9 @@ def get_log_filenames():
     """
     date_str = datetime.date.today().strftime("%Y-%m-%d")
     return {
-        "scan"  : f"scan_log_v12_{date_str}.csv",
-        "trade" : f"trade_log_v12_{date_str}.csv",
-        "skip"  : f"skip_log_v12_{date_str}.csv",
+        "scan"  : f"scan_log_{BOT_VERSION}_{date_str}.csv",
+        "trade" : f"trade_log_{BOT_VERSION}_{date_str}.csv",
+        "skip"  : f"skip_log_{BOT_VERSION}_{date_str}.csv",
     }
 
 # Module-level log file paths — set once at startup
@@ -2069,7 +2082,7 @@ def send_summary(stats, pre_bias, pcr_cache, session_bias, cap_mgr, strat_tracke
     for s, d in strat_sum.items():
         wr_s = (d["wins"] / d["trades"] * 100) if d["trades"] > 0 else 0
         strat_lines.append(f"  {s}: {d['wins']}W/{d['losses']}L ({wr_s:.0f}%)")
-    tg("📊", "Nifty v7 DAILY SUMMARY", [
+    tg("📊", f"Nifty {BOT_VERSION} DAILY SUMMARY", [
         f"Session bias : {session_bias.bias.upper()}",
         f"Pre-bias     : {pre_bias.upper()}",
         f"PCR          : {pcr_v or 'N/A'} ({pcr_b}) [{pcr_st}]",
@@ -2175,7 +2188,7 @@ def run():
     healthy, startup_ltp = check_token_health()
     if not healthy:
         send_telegram(
-            "🚨 <b>Nifty Bot v7 — TOKEN ERROR</b>\n"
+            f"🚨 <b>Nifty Bot {BOT_VERSION} — TOKEN ERROR</b>\n"
             "Upstox token invalid or expired!\n"
             "Bot will NOT start. Please refresh token."
         )
@@ -2196,9 +2209,13 @@ def run():
     # [V7-F16] Signal dedup cooldown tracker
     signal_cooldown = {}
     
-    # [V10-F3] Signal deduplication — block same level within 30 seconds
+    # [V10-F3] Signal deduplication — block same strategy/level within cooldown window
+    # [V12.4-FIX3] Raised from 30s to 300s (5 min).
+    # On May 20 the same StrongFVG signal at one price level scored 2/10 and got
+    # ScoreGate-skipped every minute for 12 minutes (12 redundant log entries for
+    # the same signal). 5-min cooldown collapses that to ~2-3 events per level.
     signal_history = {}  # {(strategy, level_key): timestamp}
-    SIGNAL_COOLDOWN_SECS = 30  # Prevent rapid-fire entries at same level
+    SIGNAL_COOLDOWN_SECS = 300  # Prevent rapid-fire entries at same level
 
     tg_listener = TelegramListener(stats, None, session_bias)
     tg_listener.restore_bias(stats.get("manual_bias", "neutral"))
@@ -2227,10 +2244,8 @@ def run():
     vix_alert_at       = None
     candles_seen       = 0    # [P5] 5m candles since open
     
-    # [V11-NEW] Rolling volatility metrics
-    atr_history        = []   # Track last 20 ATR values for normalization
-    rolling_atr_mean   = 30.0  # Will update dynamically
-    rolling_atr_std    = 5.0
+    # [V12.4-FIX2] Removed unused atr_history/rolling_atr_mean/rolling_atr_std init.
+    # These backed the dead dynamic-ATR computation that was deleted.
 
     # [V12.1-FIX] Closed-trade result history for chop detection
     # v12 read active_trades.values() which contains only OPEN trades — never had recent results.
@@ -2248,7 +2263,7 @@ def run():
     vwap_bb = vwap_cx = ema50_b = ema_cx = st_sig = cpr_sig = None
 
     send_telegram(
-        f"🤖 <b>Nifty Bot v12.1 — Multi-Trade Paper Build</b>\n\n"
+        f"🤖 <b>Nifty Bot {BOT_VERSION} — Multi-Trade Paper Build</b>\n\n"
         f"  Token check   : ✅ Live (LTP:{startup_ltp:.0f})\n"
         f"  Paper trading : ✅ No real orders\n"
         f"  Multi-trade   : ✅ Up to {MAX_CONCURRENT_GROUPS} groups concurrent\n"
@@ -2363,7 +2378,7 @@ def run():
                     save_state(stats, manual_bias="neutral")
                 log.info("14:30 — session complete. Exiting cleanly for cron.")
                 send_telegram(
-                    "✅ <b>Session complete — Nifty v8</b>\n"
+                    f"✅ <b>Session complete — Nifty {BOT_VERSION}</b>\n"
                     "Bot exiting. Cron restarts at 8:45 AM IST tomorrow."
                 )
                 break   # clean exit — do NOT loop, cron handles restart
@@ -2672,25 +2687,11 @@ def run():
             atr    = calc_atr(df_5)
             rsi    = calc_rsi(df_5)
             
-            # [V11-NEW] NORMALIZED VOLATILITY LOGIC
-            # Instead of fixed "ATR > 35", use "ATR > rolling_mean * 1.2"
-            # This adapts to market regime (high vol days vs low vol days)
-            atr_history.append(atr)
-            if len(atr_history) > 20:
-                atr_history.pop(0)  # Keep last 20
-            
-            if len(atr_history) >= 5:
-                rolling_atr_mean = sum(atr_history) / len(atr_history)
-                rolling_atr_std = (sum((x - rolling_atr_mean) ** 2 for x in atr_history) / len(atr_history)) ** 0.5
-            
-            # Use normalized threshold
-            # Trend strategies: need ATR > rolling_mean * 1.2 (20% above average)
-            # Reversal strategies: need ATR > rolling_mean * 0.8 (just above average OK)
-            atr_threshold_trend = rolling_atr_mean * 1.2 if rolling_atr_mean > 20 else 35
-            atr_threshold_reversal = rolling_atr_mean * 0.8 if rolling_atr_mean > 20 else 20
-            
-            log.debug(f"[VolatilityAdapt] ATR:{atr:.0f} | Rolling Mean:{rolling_atr_mean:.0f} | "
-                      f"TrendThresh:{atr_threshold_trend:.0f} | RevThresh:{atr_threshold_reversal:.0f}")
+            # [V12.4-FIX2] Removed dead dynamic-ATR threshold computation here (~20 lines).
+            # The atr_history rolling buffer and atr_threshold_trend/reversal were computed
+            # every loop but never read. Fixed thresholds in GROUP_ATR_MIN are the gate.
+            # If dynamic thresholds are wanted in the future, they need to actually feed
+            # into try_trade's gate (currently doesn't).
 
             # ORB formation
             if not orb_formed and t >= ORB_END_TIME:
@@ -2979,10 +2980,17 @@ def run():
                 signal_scores["RSIDivergence"] = (sig_score, sig_strength, sig_reason)
             
             # [V12-CRITICAL] FILTER by signal strength BEFORE processing
+            # [V12.4-FIX1] Counter-trend strategies get a relaxed threshold (capped at 3)
+            # since the scoring engine structurally penalises them on trending days.
+            def _effective_threshold(strat_name):
+                if strat_name in COUNTER_TREND_STRATEGIES:
+                    return min(3, min_confidence_override)  # never harsher than 3
+                return min_confidence_override
+            
             tradable_signals = {
                 name: (score, strength) 
                 for name, (score, strength, _) in signal_scores.items()
-                if score >= min_confidence_override  # Only trade STRONG signals
+                if score >= _effective_threshold(name)
             }
 
             # 5-min scan log
@@ -3073,6 +3081,13 @@ def run():
                     "manual_bias":       tg_listener.bias,
                     "auto_bias":         auto_bias_report.get("final_bias", ""),
                     "final_bias":        pre_bias,
+                    # [V12.5] Diagnostic: do bias and trend agree? Flags the
+                    # "trend bearish but bias neutral" situation that blocks signals.
+                    "bias_trend_agree":  ("BOTH_NEUTRAL" if pre_bias == "neutral" and trend == "neutral"
+                                          else "AGREE" if pre_bias == trend
+                                          else "BIAS_NEUTRAL" if pre_bias == "neutral" and trend in ("bullish","bearish")
+                                          else "TREND_NEUTRAL" if trend == "neutral" and pre_bias in ("bullish","bearish")
+                                          else "CONFLICT"),
                     "auto_bias_score":   auto_bias_report.get("score", ""),
                     "auto_bias_conf":    auto_bias_report.get("confidence", ""),
                     "pcr_source_bias":   auto_bias_report.get("pcr_bias", ""),
@@ -3103,7 +3118,7 @@ def run():
                 vix_line = f"RSI:{rsi:.0f} ATR:{atr:.0f}pts" + (f" VIX:{india_vix:.2f}" if india_vix else "")
 
                 icon = "✅" if entry_met else "⏸"
-                tg(icon, f"NIFTY v12 SCAN {now.strftime('%H:%M')}", [
+                tg(icon, f"NIFTY {BOT_VERSION} SCAN {now.strftime('%H:%M')}", [
                     f"Nifty        : {ltp:.2f} ({chg_pct:+.2f}%)",
                     f"Session bias : {session_bias.bias.upper()} Z:{zscore:+.2f}",
                     vix_line,
@@ -3176,20 +3191,18 @@ def run():
 
                 # [V12.1-FIX] CRITICAL: Gate on signal score
                 # In v12 this filter existed but was never consulted by dispatch.
-                # Now: only proceed if this strategy's score >= min_confidence_override
-                # for the current trading period (and chop adjustment).
+                # Now: only proceed if this strategy's score >= effective threshold
+                # (counter-trend strategies get a relaxed threshold per V12.4-FIX1).
                 _sig_entry = tradable_signals.get(strategy_name)
                 if _sig_entry is None:
-                    # Score below min_confidence_override threshold for current period.
-                    # [V12.3-FIX3] All 12 strategies are now scored (BOS/ORPH/RSIDiv added).
-                    # Fall-through is only used if signal_scores somehow lacks this strategy
-                    # (defensive — shouldn't happen with current code).
                     _raw = signal_scores.get(strategy_name)
                     if _raw is not None:
                         _raw_score, _raw_strength, _ = _raw
+                        _eff_thresh = _effective_threshold(strategy_name)
+                        _ct_tag = " (counter-trend relaxed)" if strategy_name in COUNTER_TREND_STRATEGIES else ""
                         _skip(f"ScoreGate: {strategy_name} score {_raw_score}/10 ({_raw_strength}) "
-                              f"< min {min_confidence_override} [{trading_period}"
-                              f"{',CHOP' if chop_detected else ''}]")
+                              f"< min {_eff_thresh} [{trading_period}"
+                              f"{',CHOP' if chop_detected else ''}]{_ct_tag}")
                         return False
                     # Strategy not in signal_scores — let it through to legacy gates
                     # (defensive fall-through; with v12.3 all strategies are scored)
@@ -3625,8 +3638,8 @@ if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        log.info("Nifty Bot v12 stopped by user")
-        send_telegram("⏹ Nifty Bot v12 stopped (KeyboardInterrupt)")
+        log.info(f"Nifty Bot {BOT_VERSION} stopped by user")
+        send_telegram(f"⏹ Nifty Bot {BOT_VERSION} stopped (KeyboardInterrupt)")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
-        send_telegram(f"🚨 Nifty Bot v12 CRASHED: {e}")
+        send_telegram(f"🚨 Nifty Bot {BOT_VERSION} CRASHED: {e}")
