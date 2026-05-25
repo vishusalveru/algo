@@ -89,12 +89,47 @@ def get_nifty_ltp():
     return None
 
 
+def get_nearest_expiry():
+    """Fetch nearest Nifty option expiry — v2 chain REQUIRES this parameter.
+    Uses /v2/option/contract, same as the production module."""
+    hr("STEP 0 — Fetch nearest expiry  (/v2/option/contract)")
+    try:
+        r = requests.get(
+            "https://api.upstox.com/v2/option/contract",
+            params={"instrument_key": NIFTY_KEY},
+            headers=HEADERS, timeout=10,
+        )
+        print(f"  HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"  Body: {r.text[:250]}")
+            return None
+        data = r.json().get("data", [])
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        expiries = sorted(set(
+            d.get("expiry", "") for d in data
+            if d.get("expiry", "") >= today
+        ))
+        print(f"  Expiries available: {expiries[:6]}")
+        for exp in expiries:
+            if exp > today:
+                print(f"  → Using nearest future expiry: {exp}")
+                return exp
+        if expiries:
+            print(f"  → Only same-day expiry available: {expiries[0]}")
+            return expiries[0]
+    except Exception as e:
+        print(f"  Expiry fetch error: {e}")
+    return None
+
+
 def fetch_v2_chain(expiry=None):
-    """v2 Put/Call option chain — strike-organized, includes greeks."""
+    """v2 Put/Call option chain — strike-organized, includes greeks.
+    REQUIRES expiry_date parameter (HTTP 400 without it)."""
     hr("TEST 1 — v2 Put/Call Option Chain  (/v2/option/chain)")
-    params = {"instrument_key": NIFTY_KEY}
-    if expiry:
-        params["expiry_date"] = expiry
+    if not expiry:
+        print("  ⚠️  No expiry provided — v2 chain will reject this. Skipping.")
+        return None
+    params = {"instrument_key": NIFTY_KEY, "expiry_date": expiry}
     try:
         r = requests.get(
             "https://api.upstox.com/v2/option/chain",
@@ -225,8 +260,14 @@ def main():
     print(f"  Nifty LTP: {ltp:.2f}  →  ATM strike: {atm}")
     print(f"  Strikes to inspect: {atm-50}, {atm}, {atm+50}\n")
 
-    # 2. v2 chain (also gives us instrument_keys for v3)
-    v2 = fetch_v2_chain()
+    # 2. Nearest expiry (REQUIRED by v2 chain)
+    expiry = get_nearest_expiry()
+    if not expiry:
+        print("\n  Could not determine expiry. v2 chain needs it. Stopping.")
+        return
+
+    # 3. v2 chain (also gives us instrument_keys for v3)
+    v2 = fetch_v2_chain(expiry)
 
     # 3. Extract instrument keys near ATM for the v3 greek call
     instr_keys = []
