@@ -292,6 +292,119 @@ def classify_intraday_regime(df_5, e9, e21, atr=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+#  MARKET CLASSIFICATION — live-data findings (v6–v10), DETECTION ONLY
+#  These describe "what the market is". Trade DECISIONS (block/size) live in
+#  the gate layer, not here. signals.py stays the single source of truth for
+#  classification so nothing downstream re-implements it.
+# ─────────────────────────────────────────────────────────────────────────
+
+# [V9-F2] Win rate BY REGIME from real April trading (documented in v10):
+#   TRENDING_BEAR 67% +2470 | WEAK_BEAR 75% +4290 | TRENDING_BULL 40% -1560
+#   WEAK_BULL 27% -4615 | RANGING 17%. Trend signals chop into SLs in
+#   weak/choppy/ranging regimes. This is reference data for the gate layer.
+REGIME_TRENDING    = {"TRENDING_BULL", "TRENDING_BEAR"}
+REGIME_BLOCK_TREND = {"WEAK_BULL", "CHOPPY", "RANGING", "UNKNOWN"}
+
+# Which of the 12 detectors are momentum/trend-type vs reversal-type.
+# [V9-F3] Trend strategies need real momentum (ATR>35); reversal strategies
+# thrive in ranging markets at the lower ATR>20 floor.
+TREND_STRATEGIES    = {"EMAStack", "EMACross", "SuperTrend", "BOS"}
+REVERSAL_STRATEGIES = {"VWAPCross", "RSIDivergence", "EMA50Bounce", "CPR"}
+ATR_TREND_MIN       = 35.0   # [V9-F3] trend strategies require ATR>35
+ATR_REVERSAL_MIN    = 20.0   # reversal strategies floor
+
+# [V8-F3a] RSI penalty applies ONLY to mean-reversion strategies. Momentum
+# strategies are NOT penalised for high RSI — it confirms their signal.
+MEAN_REV_STRATEGIES = {"EMA50Bounce", "CPR", "RSIDivergence", "VWAPCross"}
+
+# [F12] Suspend if India VIX spikes >20% from session open (regime break).
+VIX_SPIKE_PCT = 20.0
+
+
+def efficiency_ratio(closes):
+    """Kaufman efficiency ratio: net move / total path. 0=chop, 1=clean trend.
+
+    Two days with the same ATR are NOT the same market — one can trend cleanly,
+    the other whipsaw. Premium-buying needs trend; this distinguishes them.
+    Pure classification: returns the number, makes no trade decision.
+    """
+    try:
+        if closes is None or len(closes) < 3:
+            return 0.0
+        net = abs(float(closes[-1]) - float(closes[0]))
+        path = sum(abs(float(closes[i]) - float(closes[i - 1]))
+                   for i in range(1, len(closes)))
+        return round(net / path, 3) if path > 0 else 0.0
+    except Exception as e:
+        log.debug(f"efficiency_ratio error: {e}")
+        return 0.0
+
+
+def vix_bias(vix):
+    """India VIX -> fear regime. [auto_bias bands, live-tuned]
+    <13 low fear (bullish) | 13-18 neutral | >18 high fear (bearish) | >25 extreme.
+    """
+    try:
+        v = float(vix)
+    except (TypeError, ValueError):
+        return "neutral"
+    if v < 13:
+        return "bullish"
+    if v > 25:
+        return "extreme"
+    if v > 18:
+        return "bearish"
+    return "neutral"
+
+
+def is_expiry_day(today=None, expiry_str=None):
+    """True if today is the nearest-expiry day. [v10 line 1903 + live-expiry]
+    Prefer the live expiry string (robust to NSE Thu->Mon changes); fall back
+    to weekday()==Thursday only if no expiry string is supplied.
+    """
+    today = today or datetime.date.today()
+    if expiry_str:
+        try:
+            exp = datetime.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            return exp == today
+        except (ValueError, TypeError):
+            pass
+    return today.weekday() == 3  # Thursday fallback
+
+
+def classify_day_type(open_price, prev_ohlc, atr, df_5=None):
+    """[V6-F13] Classify the day from open gap + ATR + candle structure.
+    Returns (day_type, gap_pct). Pure classification, no trade decision.
+    day_type in {GAP_UP, GAP_DOWN, VOLATILE, TRENDING, RANGEBOUND, UNKNOWN}.
+    """
+    try:
+        gap_pct = 0.0
+        if prev_ohlc and prev_ohlc.get("close"):
+            gap_pct = (open_price - prev_ohlc["close"]) / prev_ohlc["close"] * 100
+        if gap_pct > GAP_FILTER_PCT:
+            return "GAP_UP", round(gap_pct, 2)
+        if gap_pct < -GAP_FILTER_PCT:
+            return "GAP_DOWN", round(gap_pct, 2)
+        if atr and atr > 40:
+            return "VOLATILE", round(gap_pct, 2)
+        if df_5 is not None and len(df_5) >= 6:
+            closes = df_5["close"].astype(float).values[-6:]
+            ups = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i - 1])
+            downs = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i - 1])
+            if ups >= 4 or downs >= 4:
+                return "TRENDING", round(gap_pct, 2)
+        return "RANGEBOUND", round(gap_pct, 2)
+    except Exception as e:
+        log.debug(f"classify_day_type error: {e}")
+        return "UNKNOWN", 0.0
+
+
+def is_trend_strategy(strategy_name):
+    """Convenience classifier: is this detector momentum/trend-type? [V9-F3]"""
+    return strategy_name in TREND_STRATEGIES
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  SIGNAL DETECTORS (12 total)
 # ─────────────────────────────────────────────────────────────────────────
 
