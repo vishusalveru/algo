@@ -71,6 +71,12 @@ TRADE_COLS = ["trade_no","ts","strategy","direction","entry_nifty","entry_premiu
               "entry_rsi","entry_atr","entry_regime","vix","strike","opt_type",
               "iv","delta","spread","exit_ts","exit_premium","duration_min",
               "exit_reason","pts","pnl","result","reasons"]
+# [FIX 1] OPEN log: written at entry so an interrupted trade is never lost.
+OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
+             "entry_premium","lots","sl","target","hold_min","strike","opt_type",
+             "iv","delta","vix","size_mult"]
+# Skip log: blocked signals broken out separately (per request) for easy review.
+SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reasons"]
 
 
 def now_ist():
@@ -244,7 +250,8 @@ def save_state(s):
 
 def init_logs():
     d = datetime.date.today().strftime("%Y-%m-%d")
-    for fn, cols in [(f"scan_v14_{d}.csv", SCAN_COLS), (f"trade_v14_{d}.csv", TRADE_COLS)]:
+    for fn, cols in [(f"scan_v14_{d}.csv", SCAN_COLS), (f"trade_v14_{d}.csv", TRADE_COLS),
+                     (f"open_v14_{d}.csv", OPEN_COLS), (f"skip_v14_{d}.csv", SKIP_COLS)]:
         if not os.path.exists(fn):
             csv.DictWriter(open(fn,"w",newline=""), fieldnames=cols).writeheader()
 
@@ -257,6 +264,25 @@ def log_trade(rec):
     d = datetime.date.today().strftime("%Y-%m-%d")
     w = csv.DictWriter(open(f"trade_v14_{d}.csv","a",newline=""), fieldnames=TRADE_COLS)
     w.writerow({c: rec.get(c,"") for c in TRADE_COLS})
+
+def log_open(pos, decision, vix):
+    """[FIX 1] Write an OPEN row at entry so a crash/restart can't lose a trade."""
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    rec = {"trade_no":pos.trade_no, "entry_ts":getattr(pos,"entry_ts_str",""),
+           "strategy":pos.strategy, "direction":pos.direction,
+           "entry_nifty":round(pos.entry_nifty,1), "entry_premium":round(pos.entry_premium,2),
+           "lots":pos.lots, "sl":round(pos.sl_price,2), "target":round(pos.target_price,2),
+           "hold_min":pos.hold_min, "strike":pos.option_strike, "opt_type":pos.option_type,
+           "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
+           "vix":vix, "size_mult":round(decision.size_mult,2)}
+    w = csv.DictWriter(open(f"open_v14_{d}.csv","a",newline=""), fieldnames=OPEN_COLS)
+    w.writerow({c: rec.get(c,"") for c in OPEN_COLS})
+
+def log_skip(rec):
+    """Blocked signals, broken out separately for easy review (per request)."""
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    w = csv.DictWriter(open(f"skip_v14_{d}.csv","a",newline=""), fieldnames=SKIP_COLS)
+    w.writerow({c: rec.get(c,"") for c in SKIP_COLS})
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 def run():
@@ -332,7 +358,7 @@ def run():
                         state["pnl"] += pnl
                         cap.on_result(reason); lock.record(pos.strategy, reason)
                         log_trade({
-                            "trade_no":pos.trade_no, "ts":now.strftime("%Y-%m-%d %H:%M:%S"),
+                            "trade_no":pos.trade_no, "ts":getattr(pos,"entry_ts_str",now.strftime("%Y-%m-%d %H:%M:%S")),
                             "strategy":pos.strategy, "direction":pos.direction,
                             "entry_nifty":round(pos.entry_nifty,1), "entry_premium":round(pos.entry_premium,2),
                             "lots":pos.lots, "sl":round(pos.sl_price,2), "target":round(pos.target_price,2),
@@ -357,9 +383,14 @@ def run():
                 time.sleep(SCAN_SLEEP); continue
 
             # ── LOOK FOR ENTRY ──
+            # [FIX 3] Hard entry cutoff: no NEW entries after TRADE_END (14:30).
+            # Existing positions are still monitored above; this only gates entries.
             sig_name, direction, strong = detect_signal(df5, df15, ind, ltp, prev_ohlc)
             decision = None
-            if sig_name and direction in ("bullish","bearish"):
+            if t >= TRADE_END:
+                if sig_name:
+                    log.info(f"Signal {sig_name} after {TRADE_END} cutoff — entry skipped")
+            elif sig_name and direction in ("bullish","bearish"):
                 opt_type = "CE" if direction=="bullish" else "PE"
                 chain = get_chain(expiry)
                 quote = build_quote(chain, atm, opt_type)
@@ -376,6 +407,13 @@ def run():
                         capital=cap, lockout=lock,
                         min_oi=MIN_OI, min_qty=MIN_QTY, max_spread_pct=MAX_SPREAD_PCT,
                     )
+                    if not decision.enter:
+                        # Blocked signal -> dedicated skip log (per request).
+                        log_skip({"datetime":now.strftime("%Y-%m-%d %H:%M:%S"),
+                                  "signal":sig_name, "direction":direction,
+                                  "regime":ind.get("regime",""), "atr":round(ind.get("atr",0),1),
+                                  "vix":vix, "size":round(decision.size_mult,2),
+                                  "reasons":"; ".join(decision.reasons)})
                     if decision.enter:
                         trade_no += 1
                         lots = max(1, min(MAX_LOTS, round(MAX_LOTS * decision.size_mult)))
@@ -385,7 +423,13 @@ def run():
                         pos = LongOptionPosition(
                             trade_no, sig_name, direction, ltp, quote,
                             decision.plan, lots, ind)
+                        # [FIX 2] stamp the real ENTRY time on the position so it
+                        # is never overwritten by the exit time later.
+                        pos.entry_ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
                         state["trades"] += 1
+                        # [FIX 1] write an OPEN row immediately so a restart or
+                        # crash mid-trade can never make the position vanish.
+                        log_open(pos, decision, vix)
                         if tg_on():
                             e = "🟢" if direction=="bullish" else "🔴"
                             tg(f"{e} <b>ENTRY #{trade_no} {sig_name}</b>\n{direction.upper()} "
