@@ -262,25 +262,68 @@ class LongOptionPosition:
         self.entry_trend = indicators.get("trend", "neutral")
         self.start_ts = start_ts if start_ts is not None else time.time()
 
-    def check_exit(self, current_bid: float, now_ts: float | None = None):
+        # MFE/MAE tracking: best (favorable) and worst (adverse) SELLABLE price
+        # seen during the hold, in premium points relative to entry. Updated
+        # every check_exit cycle. Lets us tell "signal was right but exit
+        # mis-set" apart from "signal was wrong".
+        self.mfe_pts = 0.0   # max favorable excursion (premium rose this much)
+        self.mae_pts = 0.0   # max adverse excursion (premium fell this much, <=0)
+        # confidence the trade entered with (set by the bot after construction)
+        self.confidence = indicators.get("confidence", 0)
+
+    def _update_excursion(self, sell_price):
+        """Track best/worst sellable price seen, in points vs entry."""
+        delta = sell_price - self.entry_premium
+        if delta > self.mfe_pts:
+            self.mfe_pts = round(delta, 2)
+        if delta < self.mae_pts:
+            self.mae_pts = round(delta, 2)
+
+    def check_exit(self, current_bid, now_ts=None, trend_still_agrees=True):
         """LONG-OPTION exit test — identical for CE and PE.
 
         We can only SELL at the bid. Profit when premium (bid) RISES to target.
         Returns (reason|None, sell_price, dur_min).
+
+        [FIX 3] Timeout handling: a trade that is directionally right but slow
+        should not be killed flat while the move continues (observed 2026-05-29:
+        a PE timed out, then Nifty fell another 162pts). So at timeout, if the
+        position is IN PROFIT and the trend still agrees, EXTEND the hold once
+        and ratchet a trailing stop up to lock the gain. Losers still exit at
+        timeout as before.
         """
         now_ts = now_ts if now_ts is not None else time.time()
         dur_min = (now_ts - self.start_ts) / 60.0
         sell_price = sell_fill_from_bid(current_bid)
+        self._update_excursion(sell_price)   # track MFE/MAE every cycle
 
-        # Time stop (volatility-scaled hold)
-        if dur_min >= self.hold_min:
-            return "timeout", sell_price, dur_min
+        # Ratchet a trailing stop once we are meaningfully in profit.
+        if sell_price > self.entry_premium:
+            # trail at 50% of the gain above entry
+            trail = self.entry_premium + 0.5 * (sell_price - self.entry_premium)
+            self.trail_stop = max(getattr(self, "trail_stop", 0.0), round(trail, 2))
 
-        # Long option: premium UP = profit (CE and PE alike)
+        # Target hit — take it.
         if sell_price >= self.target_price:
             return "target", sell_price, dur_min
+        # Hard stop.
         if sell_price <= self.sl_price:
             return "sl", sell_price, dur_min
+        # Trailing stop (only active once set, and below current is a giveback).
+        ts = getattr(self, "trail_stop", 0.0)
+        if ts > 0 and sell_price <= ts and ts > self.entry_premium:
+            return "trail", sell_price, dur_min
+
+        # Time stop — with the [FIX 3] extension.
+        if dur_min >= self.hold_min:
+            in_profit = sell_price > self.entry_premium
+            extended = getattr(self, "_extended", False)
+            if in_profit and trend_still_agrees and not extended:
+                # extend once, by half the original hold, and keep trailing.
+                self._extended = True
+                self.hold_min = self.hold_min + self.hold_min * 0.5
+                return None, sell_price, dur_min   # stay in, now trailing
+            return "timeout", sell_price, dur_min
 
         return None, sell_price, dur_min
 

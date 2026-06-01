@@ -77,6 +77,8 @@ def classify_day_context(
     strong_breakout: bool = False,       # fresh FVG/BOS break = chop resolving
     regime: str = "UNKNOWN",             # from signals.classify_intraday_regime
     strategy_name: str = "",             # which signals.py detector fired
+    atr_day_low: float = 0.0,            # [FIX 2] day's observed ATR range
+    atr_day_high: float = 0.0,           #         for relative trend gating
 ) -> DayContext:
     """Turn signals.py classifications into a trade decision for this moment."""
 
@@ -141,10 +143,12 @@ def classify_day_context(
         return ctx.block(f"{strategy_name} trend-type but regime={regime} "
                          f"(live WR poor here)")
 
-    # ── 6c. ATR MOMENTUM FILTER (uses signals.ATR_TREND_MIN) ───────────────
-    if is_trend_strat and atr_5m < signals.ATR_TREND_MIN:
-        return ctx.block(f"{strategy_name} trend-type needs ATR>"
-                         f"{signals.ATR_TREND_MIN} (have {atr_5m:.1f}; drift)")
+    # ── 6c. ATR MOMENTUM FILTER (uses signals.trend_atr_ok — relative) ─────
+    if is_trend_strat:
+        atr_ok, atr_why = signals.trend_atr_ok(atr_5m, atr_day_low, atr_day_high)
+        if not atr_ok:
+            return ctx.block(f"{strategy_name} trend-type: {atr_why}")
+        ctx.reasons.append(f"trend ATR ok: {atr_why}")
 
     # ── 7. FINAL SIZE FLOOR ────────────────────────────────────────────────
     if ctx.size_mult < MIN_VIABLE_SIZE:

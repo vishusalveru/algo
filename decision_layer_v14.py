@@ -39,13 +39,18 @@ class CapitalLadder:
         self.consec_wins = 0
         self.reduced = False
 
-    def on_result(self, result: str):
-        if result == "target":
+    def on_result(self, result: str, pnl: float = 0.0):
+        # A "trail" exit, or any timeout/exit that ended IN PROFIT, is a win for
+        # streak purposes. Only true losses (SL, or negative-P&L timeouts) count
+        # against the capital ladder. [FIX 1/3 alignment]
+        is_win = (result == "target") or (pnl > 0)
+        is_loss = (result == "sl") or (pnl < 0)
+        if is_win:
             self.consec_losses = 0
             self.consec_wins += 1
             if self.reduced and self.consec_wins >= 2:
                 self.reduced = False
-        elif result in LOSS_RESULTS:
+        elif is_loss:
             self.consec_wins = 0
             self.consec_losses += 1
             if self.consec_losses >= 2:
@@ -67,12 +72,18 @@ class ReentryLockout:
         last = self._last.get(strategy)
         if last is None:
             return True, "never traded today"
-        if last in LOSS_RESULTS:
+        # [FIX 1] Only a true STOP-LOSS benches a strategy. A timeout means
+        # "right direction, ran out of time" — not a misfire — so it does NOT
+        # trigger the lockout. This stops one unlucky timeout from sitting the
+        # bot out of an entire trend (observed 2026-05-29).
+        if last == "sl":
             if conf >= PERFECT_CONF:
-                return True, f"perfect {conf}/10 bypass"
+                return True, f"perfect {conf}/10 bypass after SL"
             if conf >= HIGH_CONF_REENTRY:
-                return True, f"high conf {conf}/10 re-entry"
-            return False, f"prev loss; conf {conf}<{HIGH_CONF_REENTRY}"
+                return True, f"high conf {conf}/10 re-entry after SL"
+            return False, f"prev SL; conf {conf}<{HIGH_CONF_REENTRY}"
+        if last in LOSS_RESULTS:   # timeout etc. — allowed, just note it
+            return True, f"prev {last} (not SL) — re-entry allowed"
         return True, "last was a win"
 
 
@@ -110,6 +121,8 @@ def decide_entry(
     min_oi: int = 50000,
     min_qty: int = 25,
     max_spread_pct: float = 0.08,
+    atr_day_low: float = 0.0,
+    atr_day_high: float = 0.0,
 ) -> Decision:
     """Run the full gate chain. Returns a Decision with an audit trail."""
     d = Decision()
@@ -128,6 +141,7 @@ def decide_entry(
         recent_closes=recent_closes, today=today, nearest_expiry=nearest_expiry,
         vix=vix, vix_open=vix_open, gap_pct=gap_pct, is_event_day=is_event_day,
         strong_breakout=strong_breakout, regime=regime, strategy_name=strategy_name,
+        atr_day_low=atr_day_low, atr_day_high=atr_day_high,
     )
     d.reasons.extend([f"ctx: {r}" for r in ctx.reasons])
     d.day_type = ctx.day_type

@@ -310,7 +310,43 @@ REGIME_BLOCK_TREND = {"WEAK_BULL", "CHOPPY", "RANGING", "UNKNOWN"}
 # thrive in ranging markets at the lower ATR>20 floor.
 TREND_STRATEGIES    = {"EMAStack", "EMACross", "SuperTrend", "BOS"}
 REVERSAL_STRATEGIES = {"VWAPCross", "RSIDivergence", "EMA50Bounce", "CPR"}
-ATR_TREND_MIN       = 35.0   # [V9-F3] trend strategies require ATR>35
+ATR_TREND_MIN       = 35.0   # [V9-F3] absolute crash-day reference (now a CEILING
+                             # for auto-qualify, not the only gate — see below)
+# [FIX 2] Relative-ATR trend qualification. A fixed ATR>35 (tuned on April
+# crash days, ATR 50-70) blocked every BOS on the 2026-05-29 trend day where
+# ATR peaked at 28. Instead, a trend strategy qualifies if the CURRENT ATR sits
+# in the upper part of the DAY'S OWN range — i.e. momentum relative to today —
+# OR clears the absolute floor. This generalises to bullish & bearish trends.
+ATR_DAY_PCTL_MIN    = 0.60   # current ATR must be >= 60th pct of the day's range
+ATR_ABS_FLOOR       = 18.0   # but never below this (true dead-tape cutoff)
+
+
+def trend_atr_ok(atr_now, atr_day_low, atr_day_high):
+    """[FIX 2] Is current ATR strong enough — relative to the day — for a
+    trend strategy? Returns (ok: bool, why: str). Pure classification."""
+    try:
+        atr_now = float(atr_now)
+    except (TypeError, ValueError):
+        return False, "no ATR"
+    if atr_now < ATR_ABS_FLOOR:
+        return False, f"ATR {atr_now:.1f}<{ATR_ABS_FLOOR} (dead tape)"
+    # Absolute strong-trend auto-qualify (real crash/high-vol day)
+    if atr_now >= ATR_TREND_MIN:
+        return True, f"ATR {atr_now:.1f}>={ATR_TREND_MIN} (strong)"
+    # Relative: is ATR in the upper part of today's observed range?
+    try:
+        lo, hi = float(atr_day_low), float(atr_day_high)
+        if hi > lo:
+            pctl = (atr_now - lo) / (hi - lo)
+            if pctl >= ATR_DAY_PCTL_MIN:
+                return True, (f"ATR {atr_now:.1f} at {pctl*100:.0f}pct of day "
+                              f"range [{lo:.0f}-{hi:.0f}] (relative momentum)")
+            return False, (f"ATR {atr_now:.1f} only {pctl*100:.0f}pct of day "
+                           f"range [{lo:.0f}-{hi:.0f}] (drift)")
+    except (TypeError, ValueError):
+        pass
+    # No day-range info: fall back to absolute floor already passed
+    return True, f"ATR {atr_now:.1f}>={ATR_ABS_FLOOR} (no day range, floor ok)"
 ATR_REVERSAL_MIN    = 20.0   # reversal strategies floor
 
 # [V8-F3a] RSI penalty applies ONLY to mean-reversion strategies. Momentum

@@ -69,12 +69,12 @@ SCAN_COLS = ["datetime","nifty_ltp","atm","regime","rsi","atr","vix",
 TRADE_COLS = ["trade_no","ts","strategy","direction","entry_nifty","entry_premium",
               "lots","sl","target","target_mode","hold_min","day_type",
               "entry_rsi","entry_atr","entry_regime","vix","strike","opt_type",
-              "iv","delta","spread","exit_ts","exit_premium","duration_min",
-              "exit_reason","pts","pnl","result","reasons"]
+              "iv","delta","spread","confidence","exit_ts","exit_premium","duration_min",
+              "exit_reason","mfe_pts","mae_pts","pts","pnl","result","reasons"]
 # [FIX 1] OPEN log: written at entry so an interrupted trade is never lost.
 OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
              "entry_premium","lots","sl","target","hold_min","strike","opt_type",
-             "iv","delta","vix","size_mult"]
+             "iv","delta","vix","size_mult","confidence"]
 # Skip log: blocked signals broken out separately (per request) for easy review.
 SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reasons"]
 
@@ -104,6 +104,45 @@ def tg(msg):
                             "parse_mode": "HTML"}, timeout=5)
     except Exception as e:
         log.warning(f"tg fail: {e}")
+
+def tg_document(path, caption=""):
+    """Send a file to Telegram (used for end-of-day log delivery)."""
+    if not tg_on() or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendDocument",
+                data={"chat_id": config.CHAT_ID, "caption": caption},
+                files={"document": (os.path.basename(path), f)}, timeout=30)
+        if r.status_code == 200:
+            return True
+        log.warning(f"tg_document {os.path.basename(path)}: HTTP {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        log.warning(f"tg_document fail {path}: {e}")
+    return False
+
+def send_session_files():
+    """[REQUEST] At session end, send every same-day log file to Telegram."""
+    if not tg_on():
+        return
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    # all v14 files dated today, in a sensible order
+    candidates = [f"trade_v14_{d}.csv", f"skip_v14_{d}.csv",
+                  f"open_v14_{d}.csv", f"scan_v14_{d}.csv", "nifty_v14.log"]
+    sent = 0
+    for fn in candidates:
+        if os.path.exists(fn):
+            rows = ""
+            try:
+                if fn.endswith(".csv"):
+                    n = sum(1 for _ in open(fn)) - 1   # minus header
+                    rows = f" ({max(0,n)} rows)"
+            except Exception:
+                pass
+            if tg_document(fn, caption=f"📎 {fn}{rows}"):
+                sent += 1
+    tg(f"📂 Sent {sent} log file(s) for {d}.")
 
 # ── Data fetch ───────────────────────────────────────────────────────────────
 def get_ltp():
@@ -274,7 +313,8 @@ def log_open(pos, decision, vix):
            "lots":pos.lots, "sl":round(pos.sl_price,2), "target":round(pos.target_price,2),
            "hold_min":pos.hold_min, "strike":pos.option_strike, "opt_type":pos.option_type,
            "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
-           "vix":vix, "size_mult":round(decision.size_mult,2)}
+           "vix":vix, "size_mult":round(decision.size_mult,2),
+           "confidence":getattr(pos,"confidence",0)}
     w = csv.DictWriter(open(f"open_v14_{d}.csv","a",newline=""), fieldnames=OPEN_COLS)
     w.writerow({c: rec.get(c,"") for c in OPEN_COLS})
 
@@ -296,6 +336,11 @@ def run():
     pos = None
     trade_no = state["trades"]
     last_tg_scan = time.time() - TELEGRAM_SCAN_INTERVAL
+    day_atr_low = 0.0
+    day_atr_high = 0.0
+    sess_open = None
+    sess_high = None
+    sess_low = None
 
     # Session-open context (fetched once)
     expiry = feeds.get_nearest_expiry()
@@ -321,6 +366,7 @@ def run():
                     tg(f"📊 <b>SESSION DONE</b>\nTrades {state['trades']} | "
                        f"W{state['wins']} L{state['losses']} T{state['timeouts']} | "
                        f"WR {wr:.0f}%\nP&L Rs.{state['pnl']:+.0f}")
+                    send_session_files()   # [REQUEST] deliver today's logs
                 save_state(state)
                 break
             if t < TRADE_START:
@@ -337,12 +383,54 @@ def run():
             closes = df5["close"].astype(float).tolist()[-30:]
             gap_pct = feeds.compute_gap_pct(df5["open"].iloc[0] if len(df5) else ltp, prev_ohlc)
 
-            # 5-min Telegram scan
+            # [FIX 2] track the day's observed ATR range for relative trend gating
+            _atr_now = ind.get("atr", 0)
+            if _atr_now > 0:
+                day_atr_low = min(day_atr_low, _atr_now) if day_atr_low else _atr_now
+                day_atr_high = max(day_atr_high, _atr_now)
+
+            # track session open / high / low for richer scan context
+            if sess_open is None:
+                sess_open = ltp
+            sess_high = ltp if sess_high is None else max(sess_high, ltp)
+            sess_low = ltp if sess_low is None else min(sess_low, ltp)
+
+            # 5-min Telegram scan — RICH version
             if time.time() - last_tg_scan >= TELEGRAM_SCAN_INTERVAL:
-                emoji = "📈" if ind.get("trend")=="bullish" else "📉" if ind.get("trend")=="bearish" else "➡️"
-                tg(f"{emoji} <b>SCAN {now:%H:%M}</b>\nLTP {ltp:.0f} ATR {ind.get('atr',0):.1f} "
-                   f"RSI {ind.get('rsi',0):.0f} VIX {vix}\nRegime {ind.get('regime')} | "
-                   f"Trades {state['trades']} P&L Rs.{state['pnl']:+.0f}")
+                trend = ind.get("trend", "neutral")
+                emoji = "📈" if trend=="bullish" else "📉" if trend=="bearish" else "➡️"
+                e9, e21, e50 = ind.get("e9",0), ind.get("e21",0), ind.get("e50",0)
+                eff = signals.efficiency_ratio(closes)
+                day_lo = sess_low if sess_low else ltp
+                day_hi = sess_high if sess_high else ltp
+                day_chg = ltp - sess_open if sess_open else 0
+                chg_pct = (day_chg/sess_open*100) if sess_open else 0
+                vol_lbl = ("HIGH" if ind.get("atr",0)>=25 else
+                           "MOD" if ind.get("atr",0)>=18 else "LOW")
+                chop_lbl = ("TREND" if eff>=0.4 else "MIXED" if eff>=0.25 else "CHOP")
+                pos_line = ""
+                if pos is not None:
+                    cur_bid = current_bid(get_chain(expiry), pos.option_strike, pos.option_type)
+                    upnl = (sell_fill_from_bid(cur_bid) - pos.entry_premium) * pos.lots * 65 if cur_bid else 0
+                    pos_line = (f"\n🎯 <b>OPEN #{pos.trade_no}</b> {pos.option_type}{pos.option_strike} "
+                                f"{pos.strategy}\n   entry {pos.entry_premium:.1f} → now {cur_bid:.1f} "
+                                f"| uP&L Rs.{upnl:+.0f}")
+                msg = (
+                    f"{emoji} <b>SCAN {now:%H:%M}</b>  ({chop_lbl}/{vol_lbl} vol)\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"<b>Nifty</b> {ltp:.0f}  ({day_chg:+.0f} / {chg_pct:+.2f}%)\n"
+                    f"   day {day_lo:.0f}–{day_hi:.0f}\n"
+                    f"<b>Trend</b> {trend} ({ind.get('trend_strength','?')}) | <b>regime</b> {ind.get('regime')}\n"
+                    f"<b>ATR</b> {ind.get('atr',0):.1f} (day {day_atr_low:.0f}–{day_atr_high:.0f}) | "
+                    f"<b>eff</b> {eff:.2f}\n"
+                    f"<b>RSI</b> {ind.get('rsi',0):.0f} | <b>VIX</b> {vix}\n"
+                    f"<b>EMA</b> 9:{e9:.0f} 21:{e21:.0f} 50:{e50:.0f}\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"Trades {state['trades']} (W{state['wins']} L{state['losses']} T{state['timeouts']}) "
+                    f"| P&L Rs.{state['pnl']:+.0f}"
+                    f"{pos_line}"
+                )
+                tg(msg)
                 last_tg_scan = time.time()
 
             # ── MONITOR OPEN POSITION ──
@@ -350,13 +438,23 @@ def run():
                 chain = get_chain(expiry)
                 bid = current_bid(chain, pos.option_strike, pos.option_type)
                 if bid > 0:
-                    reason, sell, dur = pos.check_exit(bid)
+                    # [FIX 3] does the live trend still agree with the position?
+                    trend_ok = (ind.get("trend") == pos.direction)
+                    reason, sell, dur = pos.check_exit(bid, trend_still_agrees=trend_ok)
                     if reason:
                         pnl, pts = pos.pnl(sell)
-                        result = "win" if reason=="target" else "loss" if reason=="sl" else "timeout"
+                        # "trail" = trailing-stop exit (a managed win/scratch).
+                        # Classify by P&L sign so a profitable timeout/trail
+                        # counts as a win, a negative one as a loss.
+                        if reason == "target" or (reason in ("trail","timeout") and pnl > 0):
+                            result = "win"
+                        elif reason == "sl" or pnl < 0:
+                            result = "loss"
+                        else:
+                            result = "timeout"
                         state["wins" if result=="win" else "losses" if result=="loss" else "timeouts"] += 1
                         state["pnl"] += pnl
-                        cap.on_result(reason); lock.record(pos.strategy, reason)
+                        cap.on_result(reason, pnl); lock.record(pos.strategy, reason)
                         log_trade({
                             "trade_no":pos.trade_no, "ts":getattr(pos,"entry_ts_str",now.strftime("%Y-%m-%d %H:%M:%S")),
                             "strategy":pos.strategy, "direction":pos.direction,
@@ -367,9 +465,13 @@ def run():
                             "entry_atr":round(pos.entry_atr,1), "entry_regime":pos.entry_trend,
                             "vix":vix, "strike":pos.option_strike, "opt_type":pos.option_type,
                             "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
-                            "spread":round(pos.option_spread,2), "exit_ts":now.strftime("%H:%M:%S"),
+                            "spread":round(pos.option_spread,2),
+                            "confidence":getattr(pos,"confidence",0),
+                            "exit_ts":now.strftime("%H:%M:%S"),
                             "exit_premium":round(sell,2), "duration_min":round(dur,1),
-                            "exit_reason":reason, "pts":pts, "pnl":pnl, "result":result,
+                            "exit_reason":reason,
+                            "mfe_pts":pos.mfe_pts, "mae_pts":pos.mae_pts,
+                            "pts":pts, "pnl":pnl, "result":result,
                             "reasons":"; ".join(pos.plan.get("reasons",[])),
                         })
                         if tg_on():
@@ -406,6 +508,7 @@ def run():
                         gap_pct=gap_pct, is_event_day=ev_today,
                         capital=cap, lockout=lock,
                         min_oi=MIN_OI, min_qty=MIN_QTY, max_spread_pct=MAX_SPREAD_PCT,
+                        atr_day_low=day_atr_low, atr_day_high=day_atr_high,
                     )
                     if not decision.enter:
                         # Blocked signal -> dedicated skip log (per request).
@@ -423,6 +526,7 @@ def run():
                         pos = LongOptionPosition(
                             trade_no, sig_name, direction, ltp, quote,
                             decision.plan, lots, ind)
+                        pos.confidence = conf   # record entry confidence for analysis
                         # [FIX 2] stamp the real ENTRY time on the position so it
                         # is never overwritten by the exit time later.
                         pos.entry_ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
