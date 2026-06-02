@@ -247,29 +247,60 @@ def compute_indicators(df5, df15, df30):
     return ind
 
 def detect_signal(df5, df15, ind, ltp, prev_ohlc):
-    """Run detectors in priority order; return (name, direction, strong)."""
+    """Run ALL detectors. Returns (name, direction, strong, all_fired) where
+    all_fired is a list of (name, direction, strong) for EVERY detector that
+    fired this cycle. The first three values are the PRIORITY pick (what the bot
+    actually trades) — unchanged behaviour. all_fired exists so per-strategy
+    data is COMPLETE and unbiased: a lower-priority signal masked by a higher
+    one still gets logged. [2026-06-01 audit fix B]"""
     atr = ind.get("atr", 30); t5 = ind.get("t5","neutral")
     trend = ind.get("trend","neutral")
+    fired = []   # every detector that fired, in priority order
     try:
         fvg, _ = signals.detect_fvg(df5)
         if fvg:
-            return "StrongFVG", fvg.get("type"), True
+            fired.append(("StrongFVG", fvg.get("type"), True))
         bos, _ = signals.detect_bos(df5, ltp)
         if bos:
-            return "BOS", bos.get("type"), True
+            fired.append(("BOS", bos.get("type"), True))
         if "df_ema" in ind:
             stk, _ = signals.detect_ema_stack(ind["df_ema"], ltp, t5, ind.get("rvol",1.0))
             if stk:
-                return "EMAStack", stk.get("type"), False
+                fired.append(("EMAStack", stk.get("type"), False))
         st, _ = signals.detect_supertrend_signal(df5, trend, ltp, atr)
         if st:
-            return "SuperTrend", st.get("type"), False
+            fired.append(("SuperTrend", st.get("type"), False))
         rdiv, _ = signals.detect_rsi_divergence(df5, None)
         if rdiv:
-            return "RSIDivergence", rdiv.get("type"), False
+            fired.append(("RSIDivergence", rdiv.get("type"), False))
     except Exception as e:
         log.error(f"detect: {e}")
-    return None, None, False
+    if fired:
+        name, direction, strong = fired[0]   # priority pick (unchanged)
+        return name, direction, strong, fired
+    return None, None, False, []
+
+# ── All-fired-signal log (audit fix B): unbiased per-strategy sample ────────
+SIGNALS_COLS = ["datetime","nifty_ltp","atm","regime","atr","rsi","vix",
+                "efficiency","signal","direction","strong","priority_pick","traded"]
+
+def log_signals_fired(now, ltp, atm, ind, vix, eff, fired, traded_name):
+    """Log EVERY detector that fired this cycle, not just the one traded.
+    'priority_pick' flags the one the bot chose; 'traded' flags if it actually
+    entered (passed all gates)."""
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    fn = f"signals_v14_{d}.csv"
+    if not os.path.exists(fn):
+        csv.DictWriter(open(fn,"w",newline=""), fieldnames=SIGNALS_COLS).writeheader()
+    w = csv.DictWriter(open(fn,"a",newline=""), fieldnames=SIGNALS_COLS)
+    for i, (name, direction, strong) in enumerate(fired):
+        w.writerow({
+            "datetime": now.strftime("%Y-%m-%d %H:%M:%S"), "nifty_ltp": round(ltp,1),
+            "atm": atm, "regime": ind.get("regime",""), "atr": round(ind.get("atr",0),1),
+            "rsi": round(ind.get("rsi",0),1), "vix": vix, "efficiency": eff,
+            "signal": name, "direction": direction, "strong": strong,
+            "priority_pick": (i == 0), "traded": (name == traded_name),
+        })
 
 # ── State + logging ──────────────────────────────────────────────────────────
 def load_state():
@@ -487,8 +518,9 @@ def run():
             # ── LOOK FOR ENTRY ──
             # [FIX 3] Hard entry cutoff: no NEW entries after TRADE_END (14:30).
             # Existing positions are still monitored above; this only gates entries.
-            sig_name, direction, strong = detect_signal(df5, df15, ind, ltp, prev_ohlc)
+            sig_name, direction, strong, all_fired = detect_signal(df5, df15, ind, ltp, prev_ohlc)
             decision = None
+            traded_signal = None   # set to the strategy name if we actually enter
             if t >= TRADE_END:
                 if sig_name:
                     log.info(f"Signal {sig_name} after {TRADE_END} cutoff — entry skipped")
@@ -527,6 +559,7 @@ def run():
                             trade_no, sig_name, direction, ltp, quote,
                             decision.plan, lots, ind)
                         pos.confidence = conf   # record entry confidence for analysis
+                        traded_signal = sig_name   # mark which signal actually traded
                         # [FIX 2] stamp the real ENTRY time on the position so it
                         # is never overwritten by the exit time later.
                         pos.entry_ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -556,6 +589,12 @@ def run():
                 "size":round(decision.size_mult,2) if decision else "",
                 "reasons":"; ".join(decision.reasons) if decision else "",
             })
+
+            # [audit fix B] Log EVERY signal that fired this cycle (unbiased
+            # per-strategy sample), not just the priority pick that got traded.
+            if all_fired:
+                log_signals_fired(now, ltp, atm, ind, vix,
+                                  signals.efficiency_ratio(closes), all_fired, traded_signal)
 
             time.sleep(SCAN_SLEEP)
 
