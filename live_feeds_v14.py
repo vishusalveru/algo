@@ -62,6 +62,44 @@ def get_nearest_expiry():
     return None
 
 
+def get_all_expiries():
+    """Sorted list of all upcoming Nifty expiries ['YYYY-MM-DD', ...]."""
+    try:
+        r = requests.get("https://api.upstox.com/v2/option/contract",
+                         headers=_headers(),
+                         params={"instrument_key": NIFTY_KEY}, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            return sorted({d.get("expiry", "") for d in data
+                           if d.get("expiry", "") >= today})
+    except Exception:
+        pass
+    return []
+
+
+def get_tradeable_expiry():
+    """The expiry we should actually TRADE.
+
+    On a normal day: the nearest expiry.
+    On EXPIRY DAY ITSELF: the nearest expiry decays to ~zero intraday (no time
+    value, vanishing bid). So we ROLL to the NEXT expiry and trade that instead
+    — those contracts still have real premium and a stable bid.
+    Returns (tradeable_expiry, nearest_expiry, rolled: bool).
+    """
+    expiries = get_all_expiries()
+    if not expiries:
+        return None, None, False
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    nearest = expiries[0]
+    if nearest == today:
+        # expiry day — roll to the next contract if one exists
+        if len(expiries) >= 2:
+            return expiries[1], nearest, True
+        return nearest, nearest, False   # no next contract available; caller blocks
+    return nearest, nearest, False
+
+
 def get_prev_day_ohlc():
     """Previous trading day's OHLC (for gap + CPR)."""
     try:

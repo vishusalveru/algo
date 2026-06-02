@@ -46,6 +46,11 @@ MIN_TARGET_PCT = 0.04    # never target less than 4% (not worth the risk)
 MAX_TARGET_PCT = 0.20    # cap target at 20% (greed control)
 SL_PCT = 0.20            # hard stop: 20% of entry premium
 ABS_MIN_ATR = 12.0       # below this 5m-ATR, market is too dead to buy premium
+# [2026-06-02] Minimum absolute premium. Options cheaper than this are
+# pathological: tiny SL in rupee terms (whipsaws out), bid vanishes as they
+# decay, and a single tick is a large % of premium. The expiry-roll handles the
+# main cause, but this is a cheap backstop for any near-worthless option.
+MIN_ABS_PREMIUM = 20.0
 
 # You enter mid-swing, not at the extreme of a range. Realistically you
 # capture only a fraction of the full expected range in your favour.
@@ -191,6 +196,11 @@ def evaluate_entry(quote: OptionQuote, atr_5m: float, iv_floor: float,
 
     # 5. Build the plan using realistic entry fill
     entry = buy_fill(quote)                 # pay the ask + tick
+
+    # 5b. Minimum absolute premium — reject near-worthless options (see const).
+    if entry < MIN_ABS_PREMIUM:
+        return False, f"premium Rs.{entry:.1f}<{MIN_ABS_PREMIUM} (too cheap/worthless)", None
+
     hold = dynamic_hold_minutes(atr_5m)
     tgt_pct = dynamic_target_pct(entry, atr_5m, quote.delta, hold)
     target = round(entry * (1 + tgt_pct), 2)

@@ -374,22 +374,35 @@ def run():
     sess_low = None
 
     # Session-open context (fetched once)
-    expiry = feeds.get_nearest_expiry()
+    # [EXPIRY ROLL 2026-06-02] On expiry day the front contract decays to ~zero
+    # intraday (vanishing bid -> the freeze). So we TRADE the next expiry instead.
+    expiry, nearest_expiry, rolled = feeds.get_tradeable_expiry()
     vix_open = feeds.get_india_vix()
     prev_ohlc = feeds.get_prev_day_ohlc()
     today = datetime.date.today()
     ev_today, ev_label = events.is_event_day(today)
+    no_next_contract = (rolled is False and nearest_expiry == today
+                        and expiry == nearest_expiry)
 
     if tg_on():
         up = events.upcoming_events(today, 7)
         ev_txt = f"\nEvent today: {ev_label}" if ev_today else ""
         up_txt = ("\nUpcoming: " + ", ".join(f"{l}(+{d}d)" for _,l,d in up)) if up else ""
-        tg(f"🤖 <b>NIFTY BOT v14 STARTED</b>\nExpiry: {expiry} | VIX open: {vix_open}{ev_txt}{up_txt}")
+        roll_txt = ""
+        if rolled:
+            roll_txt = (f"\n⚠️ EXPIRY DAY ({nearest_expiry}): rolling to NEXT "
+                        f"expiry {expiry} (front contract not traded)")
+        elif no_next_contract:
+            roll_txt = "\n🛑 EXPIRY DAY and no next contract found — NOT trading."
+        tg(f"🤖 <b>NIFTY BOT v14 STARTED</b>\nTrading expiry: {expiry} | "
+           f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}")
 
     while True:
         try:
             t = ist_time()
             now = now_ist()
+            today = now.date()   # refresh each cycle: a multi-day/overnight run
+                                 # must not use a stale date for expiry/events
             if t >= TRADE_END and pos is None:
                 log.info("Session end. Exiting.")
                 if tg_on():
@@ -407,6 +420,14 @@ def run():
             df5, df15, df30 = get_candles(5), get_candles(15), get_candles(30)
             if ltp is None or df5 is None or len(df5) < 6:
                 time.sleep(SCAN_SLEEP); continue
+            # [audit 2026-06-02] df5 is the critical frame (guarded above). If the
+            # higher-TF fetches hiccuped, fall back to df5 so multi-TF trend
+            # detection gets VALID data instead of None (which silently skewed
+            # trend to 'neutral'). Better a single-TF read than a wrong one.
+            if df15 is None or len(df15) < 3:
+                df15 = df5
+            if df30 is None or len(df30) < 3:
+                df30 = df5
 
             ind = compute_indicators(df5, df15, df30)
             vix = feeds.get_india_vix()
@@ -441,11 +462,19 @@ def run():
                 chop_lbl = ("TREND" if eff>=0.4 else "MIXED" if eff>=0.25 else "CHOP")
                 pos_line = ""
                 if pos is not None:
-                    cur_bid = current_bid(get_chain(expiry), pos.option_strike, pos.option_type)
-                    upnl = (sell_fill_from_bid(cur_bid) - pos.entry_premium) * pos.lots * 65 if cur_bid else 0
-                    pos_line = (f"\n🎯 <b>OPEN #{pos.trade_no}</b> {pos.option_type}{pos.option_strike} "
-                                f"{pos.strategy}\n   entry {pos.entry_premium:.1f} → now {cur_bid:.1f} "
-                                f"| uP&L Rs.{upnl:+.0f}")
+                    try:
+                        cur_bid = current_bid(get_chain(expiry), pos.option_strike, pos.option_type)
+                        if cur_bid and cur_bid > 0:
+                            upnl = (sell_fill_from_bid(cur_bid) - pos.entry_premium) * pos.lots * 65
+                            pos_line = (f"\n🎯 <b>OPEN #{pos.trade_no}</b> {pos.option_type}{pos.option_strike} "
+                                        f"{pos.strategy}\n   entry {pos.entry_premium:.1f} → now {cur_bid:.1f} "
+                                        f"| uP&L Rs.{upnl:+.0f}")
+                        else:
+                            pos_line = (f"\n🎯 <b>OPEN #{pos.trade_no}</b> {pos.option_type}{pos.option_strike} "
+                                        f"{pos.strategy}\n   entry {pos.entry_premium:.1f} → bid N/A (deep OTM)")
+                    except Exception as e:
+                        log.warning(f"scan uPnL fetch failed: {e}")
+                        pos_line = f"\n🎯 <b>OPEN #{pos.trade_no}</b> {pos.option_type}{pos.option_strike} (price N/A)"
                 msg = (
                     f"{emoji} <b>SCAN {now:%H:%M}</b>  ({chop_lbl}/{vol_lbl} vol)\n"
                     f"━━━━━━━━━━━━━━━\n"
@@ -468,51 +497,70 @@ def run():
             if pos is not None:
                 chain = get_chain(expiry)
                 bid = current_bid(chain, pos.option_strike, pos.option_type)
-                if bid > 0:
-                    # [FIX 3] does the live trend still agree with the position?
-                    trend_ok = (ind.get("trend") == pos.direction)
-                    reason, sell, dur = pos.check_exit(bid, trend_still_agrees=trend_ok)
-                    if reason:
-                        pnl, pts = pos.pnl(sell)
-                        # "trail" = trailing-stop exit (a managed win/scratch).
-                        # Classify by P&L sign so a profitable timeout/trail
-                        # counts as a win, a negative one as a loss.
-                        if reason == "target" or (reason in ("trail","timeout") and pnl > 0):
-                            result = "win"
-                        elif reason == "sl" or pnl < 0:
-                            result = "loss"
-                        else:
-                            result = "timeout"
-                        state["wins" if result=="win" else "losses" if result=="loss" else "timeouts"] += 1
-                        state["pnl"] += pnl
-                        cap.on_result(reason, pnl); lock.record(pos.strategy, reason)
-                        log_trade({
-                            "trade_no":pos.trade_no, "ts":getattr(pos,"entry_ts_str",now.strftime("%Y-%m-%d %H:%M:%S")),
-                            "strategy":pos.strategy, "direction":pos.direction,
-                            "entry_nifty":round(pos.entry_nifty,1), "entry_premium":round(pos.entry_premium,2),
-                            "lots":pos.lots, "sl":round(pos.sl_price,2), "target":round(pos.target_price,2),
-                            "target_mode":pos.plan.get("target_mode","pct"), "hold_min":pos.hold_min,
-                            "day_type":pos.plan.get("day_type",""), "entry_rsi":round(pos.entry_rsi,1),
-                            "entry_atr":round(pos.entry_atr,1), "entry_regime":pos.entry_trend,
-                            "vix":vix, "strike":pos.option_strike, "opt_type":pos.option_type,
-                            "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
-                            "spread":round(pos.option_spread,2),
-                            "confidence":getattr(pos,"confidence",0),
-                            "exit_ts":now.strftime("%H:%M:%S"),
-                            "exit_premium":round(sell,2), "duration_min":round(dur,1),
-                            "exit_reason":reason,
-                            "mfe_pts":pos.mfe_pts, "mae_pts":pos.mae_pts,
-                            "pts":pts, "pnl":pnl, "result":result,
-                            "reasons":"; ".join(pos.plan.get("reasons",[])),
-                        })
-                        if tg_on():
-                            e = "✅" if pnl>=0 else "❌"
-                            tg(f"{e} <b>EXIT #{pos.trade_no} {reason.upper()}</b>\n"
-                               f"{pos.strategy} {pos.direction}\nRs.{pos.entry_premium:.2f}→{sell:.2f} "
-                               f"= Rs.{pnl:+.0f} ({pts:+.1f})\n{dur:.1f}min")
-                        log.info(f"EXIT #{pos.trade_no} {result} Rs.{pnl:+.0f}")
-                        save_state(state)
-                        pos = None
+
+                # [FREEZE FIX 2026-06-XX] A deep-OTM / expiry option can have a
+                # ZERO or unavailable bid. The old code only ran check_exit when
+                # bid>0, so such a position NEVER exited — it froze open, blocked
+                # new entries, and went silent (observed live: PE 23200 @7.55).
+                # Now: if bid is unavailable we treat the sellable price as 0 and
+                # STILL evaluate the exit (time-stop / SL), so the position always
+                # resolves. A worthless option exits as a full loss, which is the
+                # truth — you can't sell it.
+                if bid <= 0:
+                    bid = 0.0
+                    log.warning(f"#{pos.trade_no} {pos.option_type}{pos.option_strike} "
+                                f"bid unavailable/zero — evaluating exit at 0")
+
+                trend_ok = (ind.get("trend") == pos.direction)
+                reason, sell, dur = pos.check_exit(bid, trend_still_agrees=trend_ok)
+
+                # Safety net: if somehow still no exit but we're past the hold or
+                # session end, force a timeout exit so it can never hang.
+                if reason is None and (dur >= pos.hold_min or t >= TRADE_END):
+                    reason = "timeout"
+                    sell = sell_fill_from_bid(bid)
+
+                if reason:
+                    pnl, pts = pos.pnl(sell)
+                    # "trail" = trailing-stop exit (a managed win/scratch).
+                    # Classify by P&L sign so a profitable timeout/trail
+                    # counts as a win, a negative one as a loss.
+                    if reason == "target" or (reason in ("trail","timeout") and pnl > 0):
+                        result = "win"
+                    elif reason == "sl" or pnl < 0:
+                        result = "loss"
+                    else:
+                        result = "timeout"
+                    state["wins" if result=="win" else "losses" if result=="loss" else "timeouts"] += 1
+                    state["pnl"] += pnl
+                    cap.on_result(reason, pnl); lock.record(pos.strategy, reason)
+                    log_trade({
+                        "trade_no":pos.trade_no, "ts":getattr(pos,"entry_ts_str",now.strftime("%Y-%m-%d %H:%M:%S")),
+                        "strategy":pos.strategy, "direction":pos.direction,
+                        "entry_nifty":round(pos.entry_nifty,1), "entry_premium":round(pos.entry_premium,2),
+                        "lots":pos.lots, "sl":round(pos.sl_price,2), "target":round(pos.target_price,2),
+                        "target_mode":pos.plan.get("target_mode","pct"), "hold_min":pos.hold_min,
+                        "day_type":pos.plan.get("day_type",""), "entry_rsi":round(pos.entry_rsi,1),
+                        "entry_atr":round(pos.entry_atr,1), "entry_regime":pos.entry_trend,
+                        "vix":vix, "strike":pos.option_strike, "opt_type":pos.option_type,
+                        "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
+                        "spread":round(pos.option_spread,2),
+                        "confidence":getattr(pos,"confidence",0),
+                        "exit_ts":now.strftime("%H:%M:%S"),
+                        "exit_premium":round(sell,2), "duration_min":round(dur,1),
+                        "exit_reason":reason,
+                        "mfe_pts":pos.mfe_pts, "mae_pts":pos.mae_pts,
+                        "pts":pts, "pnl":pnl, "result":result,
+                        "reasons":"; ".join(pos.plan.get("reasons",[])),
+                    })
+                    if tg_on():
+                        e = "✅" if pnl>=0 else "❌"
+                        tg(f"{e} <b>EXIT #{pos.trade_no} {reason.upper()}</b>\n"
+                           f"{pos.strategy} {pos.direction}\nRs.{pos.entry_premium:.2f}→{sell:.2f} "
+                           f"= Rs.{pnl:+.0f} ({pts:+.1f})\n{dur:.1f}min")
+                    log.info(f"EXIT #{pos.trade_no} {result} Rs.{pnl:+.0f}")
+                    save_state(state)
+                    pos = None
                 time.sleep(SCAN_SLEEP); continue
 
             # ── LOOK FOR ENTRY ──
@@ -524,6 +572,10 @@ def run():
             if t >= TRADE_END:
                 if sig_name:
                     log.info(f"Signal {sig_name} after {TRADE_END} cutoff — entry skipped")
+            elif no_next_contract:
+                # Expiry day with no next contract to roll to — do not trade.
+                if sig_name:
+                    log.info(f"Signal {sig_name} but expiry day + no next contract — skipped")
             elif sig_name and direction in ("bullish","bearish"):
                 opt_type = "CE" if direction=="bullish" else "PE"
                 chain = get_chain(expiry)
