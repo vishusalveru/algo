@@ -194,6 +194,8 @@ def run():
     trade_no = 0
     sl_hits_today = 0       # DAILY STOP counter (true SL exits only)
     day_pnl = 0.0
+    consec_rejects = 0      # consecutive order rejections (e.g. IP block) -> pause
+    REJECT_PAUSE_AT = 3     # after this many in a row, stop trying for the day
     last_tg = time.time() - TELEGRAM_SCAN_INTERVAL
     day_atr_low = day_atr_high = 0.0
 
@@ -361,10 +363,23 @@ def run():
                      f"computed entry {plan['entry_price']:.2f}")
             entry = execu.place_entry(quote.instr_key, LOT_QTY, tag="fvg")
             if not entry.ok:
-                log.error(f"ENTRY REJECTED: {entry.message}")
-                tg(f"❌ <b>ENTRY REJECTED</b> #{trade_no}: {entry.message[:60]}")
+                consec_rejects += 1
+                log.error(f"ENTRY REJECTED ({consec_rejects}): {entry.message}")
+                # If rejections pile up it's almost always an ACCOUNT-level block
+                # (e.g. UDAPI1154 IP whitelisting not propagated, margin, token),
+                # not a per-trade issue. Stop retrying every signal — one clear
+                # alert, then no new entries for the day.
+                if consec_rejects >= REJECT_PAUSE_AT:
+                    log.error("Too many consecutive rejections — pausing entries for the day.")
+                    tg(f"🛑 <b>ENTRIES PAUSED</b> — {consec_rejects} rejections in a row.\n"
+                       f"Likely an account/IP/margin block, not a trade issue.\n"
+                       f"Last: {entry.message[:80]}\nFix it, then restart the bot.")
+                    sl_hits_today = MAX_SL_HITS_PER_DAY  # reuse the no-new-entries gate
+                else:
+                    tg(f"❌ <b>ENTRY REJECTED</b> #{trade_no}: {entry.message[:60]}")
                 trade_no -= 1   # didn't actually enter
                 time.sleep(SCAN_SLEEP); continue
+            consec_rejects = 0   # a successful placement clears the streak
             entry_order_id = entry.order_id
             fill = execu.confirm_fill(entry.order_id, expected_fill=plan["entry_price"])
             if not fill.ok:
