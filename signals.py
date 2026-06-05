@@ -719,3 +719,43 @@ def detect_orph_orpl(ltp, prev_ohlc, trend, prev_ltp=None, gap_pct=0.0):
         return None, f"ORPH_ORPL neutral | PDH:{pdh:.0f} PDL:{pdl:.0f} gap:{gap_pct:+.2f}%"
     except Exception as e:
         return None, f"ORPH_ORPL error: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FVG EXHAUSTION FILTER  [added 2026-06-05, data-driven from 7 live/paper FVG trades]
+# ═══════════════════════════════════════════════════════════════════════════
+# Problem observed live: FVG fires LATE — it confirms a gap after the move is
+# largely done, so the option is bought with no room left (MFE +0.0) and bleeds.
+# Measurable signature across 3 sessions: the bad FVG entries had RSI extended
+# AGAINST fresh momentum (bearish PE bought when already oversold; bullish CE
+# bought when RSI not confirming) AND occurred in low-efficiency (range-bound)
+# tape. The 4 winners had neither.
+#
+# Rule: block an FVG entry only when 2+ exhaustion signals AGREE (a single noisy
+# signal — e.g. RSI near a threshold in chop — must NOT veto on its own, which
+# is the whipsaw failure mode). Thresholds set slightly loose ON PURPOSE: the
+# sample is only 7 trades, so we catch the egregious exhaustion (today's RSI
+# 29.7 PE) without curve-fitting a precise boundary. Tighten with more data.
+
+FVG_RSI_PE_OVERSOLD = 40.0   # buying a PUT below this RSI = move likely exhausted
+FVG_RSI_CE_WEAK     = 52.0   # buying a CALL below this RSI = momentum not confirming
+FVG_LOW_EFFICIENCY  = 0.20   # below this = range-bound/choppy tape
+
+def fvg_exhaustion_block(direction, rsi, efficiency, atr=None, atr_day_high=None):
+    """Return (block: bool, reasons: list). Blocks an FVG entry only when 2+
+    exhaustion signals agree. Uses factors the bot already computes; no tuned
+    weights — just a transparent count of agreeing signals."""
+    signals_fired = []
+    # S1 — RSI extended against fresh momentum (direction-aware)
+    if direction == "bearish" and rsi < FVG_RSI_PE_OVERSOLD:
+        signals_fired.append(f"RSI {rsi:.0f}<{FVG_RSI_PE_OVERSOLD:.0f} (PE into oversold)")
+    elif direction == "bullish" and rsi < FVG_RSI_CE_WEAK:
+        signals_fired.append(f"RSI {rsi:.0f}<{FVG_RSI_CE_WEAK:.0f} (CE w/o momentum)")
+    # S2 — low efficiency (range-bound / choppy)
+    if efficiency is not None and efficiency < FVG_LOW_EFFICIENCY:
+        signals_fired.append(f"efficiency {efficiency:.2f}<{FVG_LOW_EFFICIENCY} (range-bound)")
+    # S3 (optional) — ATR already at the day's extreme = move likely spent
+    if atr is not None and atr_day_high and atr_day_high > 0 and atr >= atr_day_high:
+        signals_fired.append(f"ATR {atr:.0f} at day high (move extended)")
+    block = len(signals_fired) >= 2
+    return block, signals_fired

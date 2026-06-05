@@ -43,7 +43,7 @@ from live_execution import LiveExecutor
 
 # ─────────────────────────────────────────────────────────────────────────
 MODE = "live"          # 'live' = REAL ORDERS | 'mock' = dry-run, no orders
-STRATEGY = "StrongFVG"  # the ONLY strategy this bot trades
+STRATEGY = "StrongFVG"  # legacy ref; live now trades LIVE_STRATEGIES (FVG + BOS)
 LOT_QTY = 65            # 1 Nifty lot
 MAX_SL_HITS_PER_DAY = 2 # daily stop: 2 stop-loss hits -> done
 
@@ -150,14 +150,36 @@ def compute_indicators(df5, df15, df30):
     except Exception as e: log.error(f"indicators: {e}")
     return ind
 
-def detect_fvg_only(df5, ltp):
-    """LIVE bot trades ONLY StrongFVG. Other detectors not even consulted for
-    entry (they stay in signals.py for regime use, but we act on FVG alone)."""
+def detect_live_signal(df5, ltp, ind, day_atr_high=0):
+    """LIVE bot trades StrongFVG + BOS [BOS added 2026-06-05, paper-validated].
+    FVG entries pass through the exhaustion filter (block late/exhausted entries
+    where 2+ signals agree). BOS is a structure-break signal that catches moves
+    earlier, so it is NOT exhaustion-filtered. Returns (strategy, direction) or
+    (None, None), plus logs why an FVG was blocked."""
+    rsi = ind.get("rsi", 50)
+    eff = ind.get("efficiency", None)
+    atr = ind.get("atr", None)
+    # Priority: FVG first (with exhaustion filter), then BOS.
     try:
-        fvg,_=signals.detect_fvg(df5)
-        if fvg: return fvg.get("type")  # 'bullish'/'bearish'
-    except Exception as e: log.error(f"fvg detect: {e}")
-    return None
+        fvg, _ = signals.detect_fvg(df5)
+        if fvg:
+            direction = fvg.get("type")
+            block, why = signals.fvg_exhaustion_block(direction, rsi, eff, atr, day_atr_high)
+            if block:
+                log.info(f"FVG {direction} BLOCKED (exhaustion): {', '.join(why)}")
+            else:
+                return "StrongFVG", direction
+    except Exception as e:
+        log.error(f"fvg detect: {e}")
+    try:
+        bos, _ = signals.detect_bos(df5, ltp)
+        if bos:
+            return "BOS", bos.get("type")
+    except Exception as e:
+        log.error(f"bos detect: {e}")
+    return None, None
+
+LIVE_STRATEGIES = ("StrongFVG", "BOS")   # strategies the live bot may trade
 
 # ── Logging (same schema as paper + live execution fields) ──────────────────
 TRADE_COLS=["trade_no","entry_ts","strategy","direction","entry_nifty","entry_premium",
@@ -212,6 +234,21 @@ def run():
     expiry, nearest_expiry, rolled = feeds.get_tradeable_expiry()
     vix_open = feeds.get_india_vix()
     prev_ohlc = feeds.get_prev_day_ohlc()
+
+    # [STARTUP FEED GUARD] If the live feeds come back empty, the token is
+    # almost certainly expired/invalid (UDAPI100050) or access is blocked. Do
+    # NOT pretend to be running — refuse loudly so it can't sit there looking
+    # live while unable to trade or (worse) act on missing data.
+    test_ltp = get_ltp()
+    if expiry is None or vix_open is None or test_ltp is None:
+        msg = (f"🛑 <b>LIVE BOT CANNOT START — DEAD FEEDS</b>\n"
+               f"Expiry={expiry} VIX={vix_open} LTP={test_ltp}\n"
+               f"Almost certainly an EXPIRED/INVALID TOKEN (refresh it in "
+               f"config.py) or blocked access. Bot is NOT running.")
+        log.error(msg.replace("<b>","").replace("</b>",""))
+        tg(msg)
+        return
+
     today = datetime.date.today()
     ev_today, _ = events.is_event_day(today)
     no_next = (rolled is False and nearest_expiry==today and expiry==nearest_expiry)
@@ -300,9 +337,11 @@ def run():
 
                     log_trade({"trade_no":pos.trade_no,"entry_ts":getattr(pos,"entry_ts_str",""),
                         "strategy":pos.strategy,"direction":pos.direction,
-                        "entry_nifty":round(pos.entry_nifty,1),"entry_premium":round(pos.entry_premium,2),
+                        "entry_nifty":round(pos.entry_nifty,1),
+                        "entry_premium":round(getattr(pos,"computed_entry",pos.entry_premium),2),
                         "actual_fill":round(getattr(pos,"actual_fill",pos.entry_premium),2),
-                        "slippage":round(getattr(pos,"actual_fill",pos.entry_premium)-pos.entry_premium,2),
+                        "slippage":round(getattr(pos,"actual_fill",pos.entry_premium)
+                                         - getattr(pos,"computed_entry",pos.entry_premium),2),
                         "lots":1,"sl":round(pos.sl_price,2),"sl_trigger":round(pos.sl_price,1),
                         "target":round(pos.target_price,2),"hold_min":pos.hold_min,
                         "strike":pos.option_strike,"opt_type":pos.option_type,
@@ -330,11 +369,13 @@ def run():
                     log.info(f"Daily stop active ({sl_hits_today} SL hits). No new entries.")
                 time.sleep(SCAN_SLEEP); continue
 
-            # ── LOOK FOR ENTRY (FVG only, session-gated) ──
+            # ── LOOK FOR ENTRY (FVG + BOS, session-gated) ──
             if t >= TRADE_END or t < TRADE_OPEN: time.sleep(SCAN_SLEEP); continue
             if no_next: time.sleep(SCAN_SLEEP); continue
 
-            direction = detect_fvg_only(df5, ltp)
+            # make efficiency available to the exhaustion filter
+            ind["efficiency"] = signals.efficiency_ratio(closes)
+            sig_name, direction = detect_live_signal(df5, ltp, ind, day_atr_high)
             if direction not in ("bullish","bearish"):
                 time.sleep(SCAN_SLEEP); continue
 
@@ -344,10 +385,11 @@ def run():
             if quote is None or not quote.instr_key:
                 time.sleep(SCAN_SLEEP); continue
 
-            conf = 7  # StrongFVG is always a 'strong' signal in this gate
-            decision = decide_entry(quote=quote, direction=direction, strategy_name=STRATEGY,
+            conf = 7  # both StrongFVG and BOS are 'strong' signals in this gate
+            decision = decide_entry(quote=quote, direction=direction, strategy_name=sig_name,
                 confidence=conf, atr_5m=ind.get("atr",30), recent_closes=closes,
-                now_time=t, regime=ind.get("regime","UNKNOWN"), strong_breakout=True,
+                now_time=t, regime=ind.get("regime","UNKNOWN"),
+                strong_breakout=(sig_name in LIVE_STRATEGIES),
                 today=today, nearest_expiry=expiry, vix=vix, vix_open=vix_open,
                 gap_pct=gap_pct, is_event_day=ev_today, capital=cap, lockout=lock,
                 min_oi=MIN_OI, min_qty=MIN_QTY, max_spread_pct=MAX_SPREAD_PCT,
@@ -409,10 +451,28 @@ def run():
             plan2["sl_price"]=sl_trigger
             plan2["reasons"]=decision.reasons; plan2["day_type"]=decision.day_type
             plan2["target_mode"]=decision.target_mode
-            pos = LongOptionPosition(trade_no, STRATEGY, direction, ltp, quote, plan2, 1, ind)
+            pos = LongOptionPosition(trade_no, sig_name, direction, ltp, quote, plan2, 1, ind)
             pos.confidence=conf; pos.actual_fill=actual_fill
+            pos.computed_entry=plan["entry_price"]   # keep the pre-fill estimate
             pos.entry_ts_str=now.strftime("%Y-%m-%d %H:%M:%S")
             pos_instr = quote.instr_key
+
+            # [CRASH-SAFE LOG FIX] Write an OPEN row to the live CSV the INSTANT
+            # the real order fills — before monitoring. If the bot dies before
+            # exit, the real position is still on record (mirrors the paper bot).
+            # The exit will append a separate completed-trade row.
+            log_trade({"trade_no":trade_no,"entry_ts":pos.entry_ts_str,
+                "strategy":sig_name,"direction":direction,
+                "entry_nifty":round(ltp,1),"entry_premium":round(plan["entry_price"],2),
+                "actual_fill":round(actual_fill,2),
+                "slippage":round(actual_fill-plan["entry_price"],2),"lots":1,
+                "sl":round(sl_trigger,2),"sl_trigger":round(sl_trigger,1),
+                "target":round(plan2["target_price"],2),"hold_min":pos.hold_min,
+                "strike":quote.strike,"opt_type":opt_type,
+                "iv":round(quote.iv,2),"delta":round(quote.delta,3),
+                "confidence":conf,"exit_reason":"OPEN",
+                "entry_order_id":entry_order_id or "","sl_order_id":sl_order_id or "",
+                "order_status":"filled-open"})
 
             tg(f"{'🔴' if MODE=='live' else '🟡'} <b>LIVE ENTRY #{trade_no} FVG</b>\n"
                f"{direction.upper()} {opt_type}{quote.strike}\nfill Rs.{actual_fill:.2f} "
