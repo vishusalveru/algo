@@ -227,6 +227,7 @@ def compute_indicators(df5, df15, df30):
     try:
         ind["atr"] = signals.calc_atr(df5)
         ind["rsi"] = signals.calc_rsi(df5)
+        ind["rvol"] = signals.calc_rvol(df5)   # real relative volume (None if n/a)
         dfe = signals.calc_ema(df5)
         if "ema9" in dfe.columns:
             ind["e9"] = float(dfe["ema9"].iloc[-1])
@@ -264,7 +265,7 @@ def detect_signal(df5, df15, ind, ltp, prev_ohlc):
         if bos:
             fired.append(("BOS", bos.get("type"), True))
         if "df_ema" in ind:
-            stk, _ = signals.detect_ema_stack(ind["df_ema"], ltp, t5, ind.get("rvol",1.0))
+            stk, _ = signals.detect_ema_stack(ind["df_ema"], ltp, t5, ind.get("rvol"))
             if stk:
                 fired.append(("EMAStack", stk.get("type"), False))
         st, _ = signals.detect_supertrend_signal(df5, trend, ltp, atr)

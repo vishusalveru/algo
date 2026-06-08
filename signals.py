@@ -72,6 +72,27 @@ LOT_SIZE = 65                # Nifty lot size (fixed by exchange)
 #  INDICATORS — pure math, deterministic
 # ─────────────────────────────────────────────────────────────────────────
 
+def calc_rvol(df, lookback=20):
+    """Relative volume = current candle volume / average volume over lookback.
+    Computed from live candle data (NOT a hardcoded default). Returns None if it
+    can't be computed, so callers must treat 'no data' as 'no signal' rather than
+    silently passing a fake 1.0 (which previously disabled EMAStack permanently).
+    """
+    try:
+        if df is None or len(df) < lookback + 1:
+            return None
+        vols = df["volume"].astype(float)
+        if vols.iloc[-1] <= 0:
+            return None
+        avg = vols.iloc[-(lookback+1):-1].mean()   # average EXCLUDING current
+        if avg <= 0:
+            return None
+        return round(float(vols.iloc[-1]) / avg, 2)
+    except Exception as e:
+        log.debug(f"RVOL calc error: {e}")
+        return None
+
+
 def calc_atr(df, period=14):
     """Average True Range — volatility measure."""
     try:
@@ -450,6 +471,16 @@ def detect_fvg(df):
         return None, "No candles"
     candles = df.tail(15)
     ltp_now = float(candles["close"].iloc[-1])
+    # [FVG CONFIRMATION GUARD — Option C, 2026-06-05]
+    # The old logic fired when price was merely on one side of the gap, which
+    # also fires when price is BREAKING THROUGH the gap the wrong way (a FAILED
+    # gap) — the cause of the MFE+0.0 losers (CE bought into a fall, PE into a
+    # rise). Guard: the most recent (current) candle must CLOSE in the trade's
+    # direction, confirming price is moving WITH the signal, not failing against
+    # it. Minimal, testable filter; does not rebuild the detector.
+    last = candles.iloc[-1]
+    last_up = float(last["close"]) > float(last["open"])     # bullish confirmation
+    last_down = float(last["close"]) < float(last["open"])   # bearish confirmation
     for i in range(len(candles) - 1, 1, -1):
         c1 = candles.iloc[i-2]
         c2 = candles.iloc[i-1]
@@ -465,7 +496,7 @@ def detect_fvg(df):
         if age > FVG_MAX_AGE_CANDLES:
             continue
         if c1h < c3l:
-            if ltp_now < c3l:
+            if ltp_now < c3l and last_up:   # GUARD: price confirming UP, not failing down
                 size = round(c3l - c1h, 1)
                 if size < MIN_FVG_SIZE:
                     continue
@@ -476,7 +507,7 @@ def detect_fvg(df):
                     "size": size, "strong": strong, "age": age
                 }, f"{'STRONG' if strong else 'WEAK'} Bull FVG {size:.1f}pts age:{age}c"
         if c1l > c3h:
-            if ltp_now > c3h:
+            if ltp_now > c3h and last_down:   # GUARD: price confirming DOWN, not failing up
                 size = round(c1l - c3h, 1)
                 if size < MIN_FVG_SIZE:
                     continue
@@ -519,6 +550,8 @@ def detect_bos(df, ltp):
 def detect_ema_stack(df_ema, ltp, t5, rvol):
     """EMA Stack alignment (with RVOL gate)."""
     try:
+        if rvol is None:
+            return None, "EMAStack: no RVOL data (no trade)"
         if rvol < EMASTACK_MIN_RVOL:
             return None, f"EMAStack blocked: RVOL {rvol}x < {EMASTACK_MIN_RVOL}x"
         e9 = float(df_ema["ema9"].iloc[-1])

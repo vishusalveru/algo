@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
-  nifty_live_bot.py — LIVE trading bot (REAL ORDERS), FVG-only, 1 lot
+  nifty_live_bot.py — LIVE trading bot (REAL ORDERS), FVG + BOS, 1 lot
 ═══════════════════════════════════════════════════════════════════════════
 
   ⚠️⚠️ THIS PLACES REAL ORDERS WITH REAL MONEY. ⚠️⚠️
@@ -203,7 +203,7 @@ def log_trade(rec):
 def run():
     log.info("="*60)
     banner = "🔴 LIVE MODE — REAL ORDERS" if MODE=="live" else "🟡 MOCK MODE — no real orders"
-    log.info(f"NIFTY LIVE BOT — {banner} — FVG ONLY, 1 LOT")
+    log.info(f"NIFTY LIVE BOT — {banner} — FVG + BOS, 1 LOT")
     log.info("="*60)
     init_logs()
 
@@ -255,7 +255,7 @@ def run():
 
     roll_txt = f"\n⚠️ EXPIRY: trading NEXT expiry {expiry}" if rolled else ""
     if no_next: roll_txt = "\n🛑 EXPIRY + no next contract — NOT trading."
-    tg(f"{('🔴 LIVE' if MODE=='live' else '🟡 MOCK')} <b>FVG BOT STARTED</b>\n"
+    tg(f"{('🔴 LIVE' if MODE=='live' else '🟡 MOCK')} <b>FVG+BOS BOT STARTED</b>\n"
        f"Expiry {expiry} | VIX {vix_open}\n1 lot | 20% SL (broker) | daily stop {MAX_SL_HITS_PER_DAY} SLs{roll_txt}")
 
     while True:
