@@ -237,6 +237,7 @@ def compute_indicators(df5, df15, df30):
         vb = signals.calc_vwap_bands(df5, ind.get("atr", 30))
         if len(vb):
             ind["vwap"] = float(vb.iloc[-1].get("vwap", 0))
+            ind["df_vwap"] = vb   # full frame for VWAP band-break / cross detectors
         t5, _, _ = signals.detect_trend_relaxed(df5)
         trend, _, strength = signals.detect_trend_multi(
             df5, df15, df30, ind.get("e9",0), ind.get("e21",0), ind.get("e50",0), 0)
@@ -247,7 +248,7 @@ def compute_indicators(df5, df15, df30):
         log.error(f"indicators: {e}")
     return ind
 
-def detect_signal(df5, df15, ind, ltp, prev_ohlc):
+def detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct=0.0, prev_ltp=None):
     """Run ALL detectors. Returns (name, direction, strong, all_fired) where
     all_fired is a list of (name, direction, strong) for EVERY detector that
     fired this cycle. The first three values are the PRIORITY pick (what the bot
@@ -271,9 +272,43 @@ def detect_signal(df5, df15, ind, ltp, prev_ohlc):
         st, _ = signals.detect_supertrend_signal(df5, trend, ltp, atr)
         if st:
             fired.append(("SuperTrend", st.get("type"), False))
-        rdiv, _ = signals.detect_rsi_divergence(df5, None)
+        rdiv, _ = signals.detect_rsi_divergence(df5, signals.calc_rsi_series(df5))
         if rdiv:
             fired.append(("RSIDivergence", rdiv.get("type"), False))
+        # ── Tier 1 revived detectors (paper only) [2026-06-08] ──
+        # EMACross: needs current EMA frame + prior-candle EMA frame to see a cross.
+        if "df_ema" in ind and len(df5) >= 51:
+            prev_dfe = signals.calc_ema(df5.iloc[:-1])
+            if "ema9" in prev_dfe.columns:
+                xc, _ = signals.detect_ema_cross(ind["df_ema"], prev_dfe)
+                if xc:
+                    fired.append(("EMACross", xc.get("type"), False))
+            # EMA50Bounce: price bounce/rejection at EMA50 with candle confirm.
+            b50, _ = signals.detect_ema50_bounce(ind["df_ema"], ltp, t5, df5)
+            if b50:
+                fired.append(("EMA50Bounce", b50.get("type"), False))
+        # ── Tier 2 revived detectors (paper only) [2026-06-08] ──
+        if "df_vwap" in ind:
+            vbreak, _ = signals.detect_vwap_band_break(ind["df_vwap"], ltp, t5, atr)
+            if vbreak:
+                fired.append(("VWAPBand", vbreak.get("type"), False))
+            vcross, _ = signals.detect_vwap_cross(ind["df_vwap"], ltp, df5)
+            if vcross:
+                fired.append(("VWAPCross", vcross.get("type"), False))
+        # ── Tier 3 revived detector (paper only) [2026-06-08] ──
+        # ORPH/ORPL: prev-day high/low breakout on gap days. Needs gap_pct +
+        # prev_ohlc (available) and prev_ltp (tracked across cycles in the loop).
+        orph, _ = signals.detect_orph_orpl(ltp, prev_ohlc, trend, prev_ltp, gap_pct)
+        if orph:
+            fired.append(("ORPH_ORPL", orph.get("type"), False))
+        # ── Tier 4 revived detector (paper only) [2026-06-08] ──
+        # CPR: needs pivot/bc/tc computed from prev-day OHLC (new calc_cpr) and
+        # prev_ltp to detect the cross above TC / below BC.
+        cpr_pivot, cpr_bc, cpr_tc = signals.calc_cpr(prev_ohlc)
+        if cpr_pivot is not None:
+            cpr, _ = signals.detect_cpr_signal(ltp, cpr_pivot, cpr_bc, cpr_tc, trend, prev_ltp)
+            if cpr:
+                fired.append(("CPR", cpr.get("type"), False))
     except Exception as e:
         log.error(f"detect: {e}")
     if fired:
@@ -398,6 +433,7 @@ def run():
         tg(f"🤖 <b>NIFTY BOT v14 STARTED</b>\nTrading expiry: {expiry} | "
            f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}")
 
+    prev_ltp = None   # LTP from the previous scan cycle (for ORPH/ORPL + CPR crosses)
     while True:
         try:
             t = ist_time()
@@ -567,7 +603,8 @@ def run():
             # ── LOOK FOR ENTRY ──
             # [FIX 3] Hard entry cutoff: no NEW entries after TRADE_END (14:30).
             # Existing positions are still monitored above; this only gates entries.
-            sig_name, direction, strong, all_fired = detect_signal(df5, df15, ind, ltp, prev_ohlc)
+            sig_name, direction, strong, all_fired = detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct, prev_ltp)
+            prev_ltp = ltp   # remember this cycle's LTP for next cycle's cross checks
             decision = None
             traded_signal = None   # set to the strategy name if we actually enter
             if t >= TRADE_END:

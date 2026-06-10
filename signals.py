@@ -115,8 +115,25 @@ def calc_atr(df, period=14):
         return 20.0
 
 
+def calc_rsi_series(df, period=14):
+    """Full RSI series (not just the latest value) — needed by RSI-divergence
+    detection, which compares RSI now vs RSI N candles ago. Returns None if it
+    can't be computed (caller treats None as 'no signal', not a fake series)."""
+    try:
+        if df is None or len(df) < period + 1:
+            return None
+        delta = df["close"].astype(float).diff()
+        gain = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50.0).values
+    except Exception as e:
+        log.debug(f"RSI series calc error: {e}")
+        return None
+
+
 def calc_rsi(df, period=14):
-    """Relative Strength Index — momentum measure."""
     try:
         if df is None or len(df) < period:
             return 50.0
@@ -728,6 +745,29 @@ def detect_rsi_divergence(df, rsi_series):
         return None, "No RSI divergence"
     except Exception as e:
         return None, f"RSI div error: {e}"
+
+
+def calc_cpr(prev_ohlc):
+    """Central Pivot Range levels from PREVIOUS day's OHLC.
+      pivot = (H + L + C) / 3
+      BC    = (H + L) / 2
+      TC    = pivot + (pivot - BC)   [reflection of BC across pivot]
+    Returns (pivot, bc, tc) or (None, None, None) if prev-day data is missing —
+    never a fabricated default, so callers treat 'no data' as 'no signal'."""
+    try:
+        if not prev_ohlc:
+            return None, None, None
+        h = float(prev_ohlc["high"]); l = float(prev_ohlc["low"]); c = float(prev_ohlc["close"])
+        pivot = (h + l + c) / 3.0
+        bc = (h + l) / 2.0
+        tc = pivot + (pivot - bc)
+        # TC/BC can be inverted depending on the day; order them so tc>=bc
+        if tc < bc:
+            tc, bc = bc, tc
+        return round(pivot, 1), round(bc, 1), round(tc, 1)
+    except Exception as e:
+        log.debug(f"CPR calc error: {e}")
+        return None, None, None
 
 
 def detect_orph_orpl(ltp, prev_ohlc, trend, prev_ltp=None, gap_pct=0.0):
