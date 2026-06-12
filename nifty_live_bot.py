@@ -151,15 +151,27 @@ def compute_indicators(df5, df15, df30):
     return ind
 
 def detect_live_signal(df5, ltp, ind, day_atr_high=0):
-    """LIVE bot trades StrongFVG + BOS [BOS added 2026-06-05, paper-validated].
-    FVG entries pass through the exhaustion filter (block late/exhausted entries
-    where 2+ signals agree). BOS is a structure-break signal that catches moves
-    earlier, so it is NOT exhaustion-filtered. Returns (strategy, direction) or
-    (None, None), plus logs why an FVG was blocked."""
+    """LIVE bot trades BOS + StrongFVG.
+    [2026-06-10] PRIORITY = BOS FIRST, then FVG. Rationale from paper data:
+    BOS 9 trades +Rs.1702 (+189/trade, 56% WR) vs FVG 20 trades +Rs.113
+    (+6/trade, 50% WR). BOS is higher-quality per trade, so it wins a tie.
+    FVG is NOT demoted as 'weak' — its poor historical average is inflated by
+    pre-fix MFE+0.0 losers (the failed-gap bug fixed 2026-06-05); post-fix FVG
+    should be stronger. So FVG stays a close second, to be re-evaluated as more
+    post-fix data arrives. Small sample (BOS n=9) — revisit, don't treat as final.
+    BOS is a structure break (not exhaustion-filtered); FVG keeps its exhaustion
+    filter. Returns (strategy, direction) or (None, None)."""
     rsi = ind.get("rsi", 50)
     eff = ind.get("efficiency", None)
     atr = ind.get("atr", None)
-    # Priority: FVG first (with exhaustion filter), then BOS.
+    # Priority 1: BOS (higher per-trade quality in paper data).
+    try:
+        bos, _ = signals.detect_bos(df5, ltp)
+        if bos:
+            return "BOS", bos.get("type")
+    except Exception as e:
+        log.error(f"bos detect: {e}")
+    # Priority 2: FVG (with exhaustion filter — blocks late/exhausted entries).
     try:
         fvg, _ = signals.detect_fvg(df5)
         if fvg:
@@ -171,12 +183,6 @@ def detect_live_signal(df5, ltp, ind, day_atr_high=0):
                 return "StrongFVG", direction
     except Exception as e:
         log.error(f"fvg detect: {e}")
-    try:
-        bos, _ = signals.detect_bos(df5, ltp)
-        if bos:
-            return "BOS", bos.get("type")
-    except Exception as e:
-        log.error(f"bos detect: {e}")
     return None, None
 
 LIVE_STRATEGIES = ("StrongFVG", "BOS")   # strategies the live bot may trade
@@ -305,8 +311,17 @@ def run():
                 if bid<=0: bid=0.0
                 trend_ok = (ind.get("trend")==pos.direction)
                 reason, sell, dur = pos.check_exit(bid, trend_still_agrees=trend_ok)
-                if reason is None and (dur>=pos.hold_min or t>=TRADE_END):
+                # A position opened before 14:30 is monitored to its OWN exit —
+                # its hold_min timeout, target, or SL. It is NOT force-closed just
+                # because the clock passed 14:30 (that rule gates NEW entries only).
+                if reason is None and dur>=pos.hold_min:
                     reason="timeout"; sell=sell_fill_from_bid(bid)
+                # HARD BACKSTOP: never let a real position run into the close.
+                # Max hold is 55min; a 14:29 entry could reach ~15:24, so force
+                # an exit by 15:25 regardless. Insurance against any edge case.
+                if reason is None and t >= datetime.time(15, 25):
+                    reason="timeout"; sell=sell_fill_from_bid(bid)
+                    log.warning(f"HARD BACKSTOP force-exit at {t} (near close)")
 
                 if reason:
                     # EXIT: if SL already fired at broker, the position is gone;
@@ -401,9 +416,9 @@ def run():
             # ── PLACE REAL ENTRY ──
             trade_no += 1
             plan = decision.plan
-            log.info(f"ENTRY SIGNAL #{trade_no} FVG {direction} {opt_type}{quote.strike} "
+            log.info(f"ENTRY SIGNAL #{trade_no} {sig_name} {direction} {opt_type}{quote.strike} "
                      f"computed entry {plan['entry_price']:.2f}")
-            entry = execu.place_entry(quote.instr_key, LOT_QTY, tag="fvg")
+            entry = execu.place_entry(quote.instr_key, LOT_QTY, tag=sig_name.lower())
             if not entry.ok:
                 consec_rejects += 1
                 log.error(f"ENTRY REJECTED ({consec_rejects}): {entry.message}")
@@ -421,14 +436,25 @@ def run():
                     tg(f"❌ <b>ENTRY REJECTED</b> #{trade_no}: {entry.message[:60]}")
                 trade_no -= 1   # didn't actually enter
                 time.sleep(SCAN_SLEEP); continue
-            consec_rejects = 0   # a successful placement clears the streak
             entry_order_id = entry.order_id
             fill = execu.confirm_fill(entry.order_id, expected_fill=plan["entry_price"])
             if not fill.ok:
-                log.error(f"ENTRY FILL NOT CONFIRMED: {fill.message}. CHECK BROKER MANUALLY.")
-                tg(f"⚠️ <b>FILL UNCONFIRMED</b> #{trade_no} — check broker manually!")
+                # A placed order that won't fill (margin shortfall, etc.) is still
+                # a rejection for pause purposes — count it like a placement reject
+                # so repeated fill failures pause the day instead of spamming.
+                consec_rejects += 1
+                log.error(f"ENTRY FILL NOT CONFIRMED ({consec_rejects}): {fill.message}. CHECK BROKER MANUALLY.")
+                if consec_rejects >= REJECT_PAUSE_AT:
+                    log.error("Too many consecutive fill failures — pausing entries for the day.")
+                    tg(f"🛑 <b>ENTRIES PAUSED</b> — {consec_rejects} fill failures in a row.\n"
+                       f"Likely margin/account block, not a trade issue.\n"
+                       f"Last: {fill.message[:80]}\nFix it, then restart the bot.")
+                    sl_hits_today = MAX_SL_HITS_PER_DAY  # reuse the no-new-entries gate
+                else:
+                    tg(f"⚠️ <b>FILL UNCONFIRMED</b> #{trade_no} — check broker manually!")
                 trade_no -= 1
                 time.sleep(SCAN_SLEEP); continue
+            consec_rejects = 0   # cleared only after a CONFIRMED fill (not mere placement)
 
             actual_fill = fill.fill_price if fill.fill_price>0 else plan["entry_price"]
             # SL trigger from the ACTUAL fill (20% below)

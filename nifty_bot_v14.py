@@ -31,6 +31,7 @@ import pandas as pd
 import pytz
 
 import signals
+import regime_classifier_v2 as rc2   # v2 regime (shadow/observational)
 import config
 import live_feeds_v14 as feeds
 import event_calendar_v14 as events
@@ -65,12 +66,16 @@ SIGNAL_PRIORITY = [
 STRONG_BREAKOUT_STRATS = {"StrongFVG", "BOS"}
 
 SCAN_COLS = ["datetime","nifty_ltp","atm","regime","rsi","atr","vix",
-             "trend","efficiency","signal","decision","size","reasons"]
+             "trend","efficiency","signal","decision","size","reasons",
+             # ── v2 shadow (observational, gates nothing) [2026-06-11] ──
+             "v2_direction","v2_strength","v2_momentum","v2_quality","v2_r2"]
 TRADE_COLS = ["trade_no","ts","strategy","direction","entry_nifty","entry_premium",
               "lots","sl","target","target_mode","hold_min","day_type",
               "entry_rsi","entry_atr","entry_regime","vix","strike","opt_type",
               "iv","delta","spread","confidence","exit_ts","exit_premium","duration_min",
-              "exit_reason","mfe_pts","mae_pts","pts","pnl","result","reasons"]
+              "exit_reason","mfe_pts","mae_pts","pts","pnl","result","reasons",
+              # v2 state AT ENTRY (shadow instrumentation, audit fix B 2026-06-11)
+              "entry_v2_strength","entry_v2_momentum","entry_v2_r2"]
 # [FIX 1] OPEN log: written at entry so an interrupted trade is never lost.
 OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
              "entry_premium","lots","sl","target","hold_min","strike","opt_type",
@@ -434,6 +439,10 @@ def run():
            f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}")
 
     prev_ltp = None   # LTP from the previous scan cycle (for ORPH/ORPL + CPR crosses)
+    rsi_hist = []     # rolling RSI history (~10 scans ≈ one 5-min candle) so the
+                      # v2 roll-over check compares against CANDLE-scale RSI, not
+                      # 30s scan flicker (audit 2026-06-11: 15% of scans jump >=2
+                      # RSI pts on noise/candle-boundary recalc — wrong cadence)
     while True:
         try:
             t = ist_time()
@@ -589,6 +598,9 @@ def run():
                         "mfe_pts":pos.mfe_pts, "mae_pts":pos.mae_pts,
                         "pts":pts, "pnl":pnl, "result":result,
                         "reasons":"; ".join(pos.plan.get("reasons",[])),
+                        "entry_v2_strength":getattr(pos,"entry_v2",{}).get("strength"),
+                        "entry_v2_momentum":getattr(pos,"entry_v2",{}).get("momentum"),
+                        "entry_v2_r2":getattr(pos,"entry_v2",{}).get("r_squared"),
                     })
                     if tg_on():
                         e = "✅" if pnl>=0 else "❌"
@@ -603,6 +615,18 @@ def run():
             # ── LOOK FOR ENTRY ──
             # [FIX 3] Hard entry cutoff: no NEW entries after TRADE_END (14:30).
             # Existing positions are still monitored above; this only gates entries.
+            # ── v2 regime SHADOW computation (observational; gates nothing) ──
+            # Computed BEFORE entry detection so the entry row can carry the
+            # v2 state at entry time (audit fix B 2026-06-11). rsi_prev is from
+            # ~one 5-min candle ago (10 scans), not the previous 30s scan.
+            rsi_hist.append(ind.get("rsi"))
+            if len(rsi_hist) > 10:
+                rsi_hist.pop(0)
+            _rsi_candle_ago = rsi_hist[0] if len(rsi_hist) == 10 else None
+            _v2_closes = df5["close"].astype(float).tolist() if df5 is not None else None
+            v2 = rc2.classify_regime_v2(_v2_closes, ind.get("rsi"), ind.get("atr"),
+                                        signals.efficiency_ratio(closes), _rsi_candle_ago)
+
             sig_name, direction, strong, all_fired = detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct, prev_ltp)
             prev_ltp = ltp   # remember this cycle's LTP for next cycle's cross checks
             decision = None
@@ -649,6 +673,7 @@ def run():
                             trade_no, sig_name, direction, ltp, quote,
                             decision.plan, lots, ind)
                         pos.confidence = conf   # record entry confidence for analysis
+                        pos.entry_v2 = dict(v2)   # v2 state AT ENTRY (shadow; for validation join)
                         traded_signal = sig_name   # mark which signal actually traded
                         # [FIX 2] stamp the real ENTRY time on the position so it
                         # is never overwritten by the exit time later.
@@ -669,6 +694,7 @@ def run():
                         save_state(state)
 
             # Log every scan with the decision audit trail
+            # (v2 computed earlier this iteration, before entry detection)
             log_scan({
                 "datetime":now.strftime("%Y-%m-%d %H:%M:%S"), "nifty_ltp":round(ltp,1),
                 "atm":atm, "regime":ind.get("regime",""), "rsi":round(ind.get("rsi",0),1),
@@ -678,6 +704,9 @@ def run():
                 "decision":"ENTER" if (decision and decision.enter) else ("BLOCK" if decision else "no-signal"),
                 "size":round(decision.size_mult,2) if decision else "",
                 "reasons":"; ".join(decision.reasons) if decision else "",
+                "v2_direction":v2.get("direction"), "v2_strength":v2.get("strength"),
+                "v2_momentum":v2.get("momentum"), "v2_quality":v2.get("quality"),
+                "v2_r2":v2.get("r_squared"),
             })
 
             # [audit fix B] Log EVERY signal that fired this cycle (unbiased
