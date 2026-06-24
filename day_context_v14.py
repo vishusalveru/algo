@@ -79,6 +79,9 @@ def classify_day_context(
     strategy_name: str = "",             # which signals.py detector fired
     atr_day_low: float = 0.0,            # [FIX 2] day's observed ATR range
     atr_day_high: float = 0.0,           #         for relative trend gating
+    smart_gap_filter: bool = False,      # PAPER-ONLY test (2026-06-24): smarter
+                                         # gap-opposition (see §4). Live leaves
+                                         # this False = unchanged blunt behaviour.
 ) -> DayContext:
     """Turn signals.py classifications into a trade decision for this moment."""
 
@@ -119,7 +122,21 @@ def classify_day_context(
         ctx.reasons.append(f"gap day {gap_pct:+.2f}%")
         gap_dir = "bullish" if gap_pct > 0 else "bearish"
         if gap_dir != direction:
-            ctx.penalise(0.6, f"gap {gap_dir} opposes {direction} entry")
+            if smart_gap_filter:
+                # PAPER TEST: skip-audit (2026-06-24) showed the blunt gap-
+                # opposition penalty blocked ~41% of BOS signals that would have
+                # won (avg MFE +11.8). The danger is fading a gap IN CHOP (06-24:
+                # gap-down + chop = false breaks). But when price has an
+                # ESTABLISHED opposing trend (high efficiency), the gap is stale
+                # and the trend matters more. So only penalise gap-opposition
+                # when the tape is ALSO choppy; let clean opposing trends through.
+                er_now = signals.efficiency_ratio(recent_closes)
+                if er_now < MIN_EFFICIENCY:
+                    ctx.penalise(0.6, f"gap {gap_dir} opposes {direction} entry (chop er{er_now:.2f})")
+                else:
+                    ctx.reasons.append(f"gap {gap_dir} opposes {direction} but clean trend er{er_now:.2f} — allowed")
+            else:
+                ctx.penalise(0.6, f"gap {gap_dir} opposes {direction} entry")
 
     # ── 5. TREND vs CHOP (uses signals.efficiency_ratio) ───────────────────
     #   Chop hurts premium-buyers — BUT every breakout emerges FROM chop. So

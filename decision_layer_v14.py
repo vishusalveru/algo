@@ -123,6 +123,7 @@ def decide_entry(
     max_spread_pct: float = 0.08,
     atr_day_low: float = 0.0,
     atr_day_high: float = 0.0,
+    smart_gap_filter: bool = False,   # PAPER-ONLY gap-filter test; default off = live unchanged
 ) -> Decision:
     """Run the full gate chain. Returns a Decision with an audit trail."""
     d = Decision()
@@ -142,6 +143,7 @@ def decide_entry(
         vix=vix, vix_open=vix_open, gap_pct=gap_pct, is_event_day=is_event_day,
         strong_breakout=strong_breakout, regime=regime, strategy_name=strategy_name,
         atr_day_low=atr_day_low, atr_day_high=atr_day_high,
+        smart_gap_filter=smart_gap_filter,
     )
     d.reasons.extend([f"ctx: {r}" for r in ctx.reasons])
     d.day_type = ctx.day_type

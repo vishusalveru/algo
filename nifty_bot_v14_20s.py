@@ -42,7 +42,7 @@ from trade_engine_v14 import OptionQuote, LongOptionPosition, sell_fill_from_bid
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  [%(levelname)s]  %(message)s",
-    handlers=[logging.FileHandler("nifty_v14.log"), logging.StreamHandler()],
+    handlers=[logging.FileHandler("nifty_v14_20s.log"), logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
@@ -52,8 +52,13 @@ IST = pytz.timezone("Asia/Kolkata")
 TRADE_START = datetime.time(9, 30)
 TRADE_END = datetime.time(14, 30)
 HARD_CLOSE = datetime.time(15, 10)
-SCAN_SLEEP = 30                 # seconds between cycles
-TAG = "v14"                     # filename tag (constant)
+# ── 20-SECOND SCAN TEST VARIANT (paper-only, parallel to the 30s bot) ──
+# Identical logic to nifty_bot_v14.py; ONLY scan interval + filename tag differ.
+# Writes scan_v14_20s_<date>.csv, trade_v14_20s_<date>.csv, etc. + nifty_v14_20s.log
+# so it never collides with the 30s bot's files. Run both same day to compare
+# scan speed as the only variable. PAPER ONLY.
+SCAN_SLEEP = 20                 # 20s (vs 30s in the standard bot)
+TAG = "v14_20s"                 # all output filenames carry the _20s marker
 TELEGRAM_SCAN_INTERVAL = 300    # 5-min market scan alerts
 MAX_LOTS = 2
 MIN_OI = 50000
@@ -678,9 +683,6 @@ def run():
                         capital=cap, lockout=lock,
                         min_oi=MIN_OI, min_qty=MIN_QTY, max_spread_pct=MAX_SPREAD_PCT,
                         atr_day_low=day_atr_low, atr_day_high=day_atr_high,
-                        smart_gap_filter=True,  # PAPER test (2026-06-24): smarter
-                        # gap-opposition (allow gap-opposing entries in CLEAN trends,
-                        # penalise only in chop). Live keeps blunt rule (default False).
                     )
                     if not decision.enter:
                         # Blocked signal -> dedicated skip log (per request).

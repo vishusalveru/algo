@@ -585,8 +585,9 @@ def detect_ema_stack(df_ema, ltp, t5, rvol):
                 "e21": round(e21, 1), "e50": round(e50, 1)
             }, f"EMA Stack bear RVOL:{rvol}x E9{e9:.0f} E21{e21:.0f} E50{e50:.0f}"
         return None, "No EMA stack"
-    except:
-        return None, "EMA stack error"
+    except Exception as e:
+        log.warning(f"detect_ema_stack error: {e!r}")
+        return None, f"EMA stack error: {e}"
 
 
 def detect_ema_cross(df_ema, prev_df_ema):
@@ -607,8 +608,9 @@ def detect_ema_cross(df_ema, prev_df_ema):
                 "type": "bearish", "e9": round(e9, 1), "e21": round(e21, 1)
             }, f"EMA9 crossed below EMA21 at {e9:.0f}"
         return None, f"No EMA cross gap {round(e9-e21, 1)}pts"
-    except:
-        return None, "EMA cross error"
+    except Exception as e:
+        log.warning(f"detect_ema_cross error: {e!r}")
+        return None, f"EMA cross error: {e}"
 
 
 def detect_vwap_band_break(df_vwap, ltp, t5, atr):
@@ -630,8 +632,9 @@ def detect_vwap_band_break(df_vwap, ltp, t5, atr):
             return {"type": "bearish", "level": round(vl1, 1)}, \
                    f"Broke below VWAP-1SD at {vl1:.0f} ATR:{atr:.0f}"
         return None, f"No band break U1:{vu1:.0f} L1:{vl1:.0f}"
-    except:
-        return None, "VWAP band error"
+    except Exception as e:
+        log.warning(f"detect_vwap_band_break error: {e!r}")
+        return None, f"VWAP band error: {e}"
 
 
 def detect_vwap_cross(df_vwap, ltp, df_5):
@@ -656,8 +659,9 @@ def detect_vwap_cross(df_vwap, ltp, df_5):
             return {"type": "bearish", "vwap": round(vwap, 1)}, \
                    f"VWAP cross bear 2c+vol at {vwap:.0f}"
         return None, f"No VWAP cross VWAP:{vwap:.0f}"
-    except:
-        return None, "VWAP cross error"
+    except Exception as e:
+        log.warning(f"detect_vwap_cross error: {e!r}")
+        return None, f"VWAP cross error: {e}"
 
 
 def detect_ema50_bounce(df_ema, ltp, t5, df_5):
@@ -680,8 +684,9 @@ def detect_ema50_bounce(df_ema, ltp, t5, df_5):
             return {"type": "bearish", "e50": round(e50, 1)}, \
                    f"EMA50 rejection bear at {e50:.0f} dist:{dist:.0f}pts"
         return None, f"EMA50 near {e50:.0f} no candle confirm"
-    except:
-        return None, "EMA50 error"
+    except Exception as e:
+        log.warning(f"detect_ema50_bounce error: {e!r}")
+        return None, f"EMA50 error: {e}"
 
 
 def detect_supertrend_signal(df, trend, ltp=None, atr=None):

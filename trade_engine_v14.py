@@ -309,6 +309,13 @@ class LongOptionPosition:
         # mis-set" apart from "signal was wrong".
         self.mfe_pts = 0.0   # max favorable excursion (premium rose this much)
         self.mae_pts = 0.0   # max adverse excursion (premium fell this much, <=0)
+        # MFE TRAJECTORY (2026-06-23): capture MFE-so-far at fixed minute marks
+        # into the trade. Peak MFE alone can't tell us WHEN follow-through
+        # appeared — needed to test an early-cut rule ("low MFE by min X = likely
+        # timeout loser"). These record the trajectory; they gate nothing.
+        self.mfe_at_2min = None
+        self.mfe_at_5min = None
+        self.mfe_at_10min = None
         # confidence the trade entered with (set by the bot after construction)
         self.confidence = indicators.get("confidence", 0)
 
@@ -319,6 +326,15 @@ class LongOptionPosition:
             self.mfe_pts = round(delta, 2)
         if delta < self.mae_pts:
             self.mae_pts = round(delta, 2)
+        # MFE-trajectory checkpoints: first time we cross each minute mark,
+        # snapshot the MFE reached SO FAR. (None stays if trade exits before mark.)
+        elapsed_min = (time.time() - self.start_ts) / 60.0
+        if self.mfe_at_2min is None and elapsed_min >= 2:
+            self.mfe_at_2min = self.mfe_pts
+        if self.mfe_at_5min is None and elapsed_min >= 5:
+            self.mfe_at_5min = self.mfe_pts
+        if self.mfe_at_10min is None and elapsed_min >= 10:
+            self.mfe_at_10min = self.mfe_pts
 
     def check_exit(self, current_bid, now_ts=None, trend_still_agrees=True):
         """LONG-OPTION exit test — identical for CE and PE.

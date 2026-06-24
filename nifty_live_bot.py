@@ -192,7 +192,9 @@ TRADE_COLS=["trade_no","entry_ts","strategy","direction","entry_nifty","entry_pr
     "actual_fill","slippage","lots","sl","sl_trigger","target","hold_min","strike","opt_type",
     "iv","delta","spread","confidence","exit_ts","exit_premium","actual_exit_fill",
     "duration_min","exit_reason","mfe_pts","mae_pts","pts","pnl","result",
-    "entry_order_id","sl_order_id","exit_order_id","order_status","reasons"]
+    "entry_order_id","sl_order_id","exit_order_id","order_status","reasons",
+    # execution-measurement fields (2026-06-17, desk-review priority):
+    "exit_slippage","total_slippage","stop_efficiency"]
 
 def init_logs():
     d=datetime.date.today().strftime("%Y-%m-%d")
@@ -368,7 +370,18 @@ def run():
                         "pts":round(pnl_pts,2),"pnl":pnl,"result":result,
                         "entry_order_id":entry_order_id or "","sl_order_id":sl_order_id or "",
                         "exit_order_id":exit_oid,"order_status":"filled",
-                        "reasons":"; ".join(pos.plan.get("reasons",[]))})
+                        "reasons":"; ".join(pos.plan.get("reasons",[])),
+                        # execution measurement (desk-review priority, 2026-06-17):
+                        # exit slippage = real exit fill vs intended exit price.
+                        "exit_slippage":round(actual_exit - sell, 2),
+                        # total slippage = entry slip + exit slip (full round-trip cost).
+                        "total_slippage":round((getattr(pos,"actual_fill",pos.entry_premium)
+                                               - getattr(pos,"computed_entry",pos.entry_premium))
+                                               + (actual_exit - sell), 2),
+                        # stop_efficiency: for SL losers, actual loss / max-possible
+                        # loss (SL distance). ~1 = stop worked; >1 = overshoot/slippage.
+                        "stop_efficiency":(round(abs(pnl_pts)/abs(pos.entry_premium-pos.sl_price),2)
+                                           if pnl<0 and pos.entry_premium!=pos.sl_price else "")})
 
                     e="✅" if pnl>=0 else "❌"
                     tg(f"{e} <b>LIVE EXIT #{pos.trade_no} {reason.upper()}</b>\n"
