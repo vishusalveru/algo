@@ -23,6 +23,7 @@ import time
 import logging
 import datetime
 import csv
+import glob
 import os
 import json
 import requests
@@ -50,6 +51,16 @@ NIFTY_KEY = "NSE_INDEX|Nifty 50"
 IST = pytz.timezone("Asia/Kolkata")
 
 TRADE_START = datetime.time(9, 30)
+# ── SESSION CLOCK ──────────────────────────────────────────────────────────
+# [REVIEWED 2026-09-06] NSE extended the F&O close 15:30 -> 15:40 on 2026-08-03
+# (to align with the cash-market Closing Auction Session, 15:15-15:35). The
+# constants below were NOT changed, and the data says they need no change:
+# across 148 logged exits the latest was 15:07, so HARD_CLOSE has never fired.
+# Entries stop at TRADE_END and max hold is ~30min, so positions are flat long
+# before any close. HARD_CLOSE stays a backstop, now with a wider margin.
+# NOTE: 15:15-15:35 is the cash CAS window — index prints there may behave
+# unusually. Our exits sit before it in practice; worth watching, not gating.
+MARKET_CLOSE = datetime.time(15, 40)   # F&O close (documentation/reference)
 TRADE_END = datetime.time(14, 30)
 HARD_CLOSE = datetime.time(15, 10)
 SCAN_SLEEP = 30                 # seconds between cycles
@@ -88,6 +99,127 @@ OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
              "iv","delta","vix","size_mult","confidence"]
 # Skip log: blocked signals broken out separately (per request) for easy review.
 SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reasons"]
+
+# ── CHAIN-OI SNAPSHOT (2026-07-17, PAPER-ONLY, OBSERVATIONAL) ───────────────
+# WHY: 07-17 whipsaw — bearish PE 14:02 (SL -1680) then bullish CE 14:21
+# (trail -328), 19min apart, while the regime label itself flipped BEAR<->BULL.
+# Price-derived signals (regime, efficiency) all whipsaw WITH price. Writer
+# positioning (OI change) is an ORTHOGONAL source: in a real whipsaw it should
+# read "mixed / no conviction" on both sides. We LOG it first (this file),
+# derive thresholds from the data later, gate nothing yet — same ladder as
+# rvol / atr_slope / v2. NSE disseminates OI in ~3-min batches, so we snapshot
+# every CHAIN_OI_EVERY_N cycles (~2min) — captures every batch, minimal cost.
+CHAIN_OI_EVERY_N = 4          # every 4th 30s cycle ≈ 2 minutes
+CHAIN_OI_WINDOW_S = 900       # 15-min rolling delta window
+CHAIN_COLS = ["datetime","nifty_ltp","atm"] + \
+    [f"s_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
+    ["sup_build_15m","res_build_15m","pe_below_open","ce_above_open","oi_state"]
+
+_oi_hist = {}    # absolute strike -> list[(ts, ce_oi, pe_oi)], pruned to ~25min
+_oi_open = {}    # absolute strike -> (ce_oi, pe_oi) first seen today
+_last_oi_state = []  # [state_str] — most recent oi_state for TG/entry context
+_last_oi_builds = []  # [sup_build_15m, res_build_15m] — for TG scan display
+
+def snapshot_chain_oi(chain, atm, ltp, now_ts):
+    """Extract ATM±3 OI, update history, compute positioning deltas.
+    OBSERVATIONAL: returns a log row; nothing gates on it. None-safe throughout —
+    a missing strike/row simply logs blank (no fabricated values)."""
+    row = {"datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "nifty_ltp": ltp, "atm": atm}
+    offsets = {"m3": -150, "m2": -100, "m1": -50, "atm": 0, "p1": 50, "p2": 100, "p3": 150}
+    strikes_now = {}
+    by_strike = {r.get("strike_price"): r for r in (chain or [])}
+    for lab, off in offsets.items():
+        stk = atm + off
+        r = by_strike.get(stk) or by_strike.get(float(stk))
+        ce = pe = None
+        if r:
+            ce = ((r.get("call_options") or {}).get("market_data") or {}).get("oi")
+            pe = ((r.get("put_options") or {}).get("market_data") or {}).get("oi")
+        row[f"s_{lab}_ce"] = ce if ce is not None else ""
+        row[f"s_{lab}_pe"] = pe if pe is not None else ""
+        if ce is not None and pe is not None:
+            strikes_now[stk] = (int(ce), int(pe))
+    # update history + day-open baseline (keyed by ABSOLUTE strike so ATM drift
+    # never corrupts a delta)
+    for stk, (ce, pe) in strikes_now.items():
+        _oi_open.setdefault(stk, (ce, pe))
+        h = _oi_hist.setdefault(stk, [])
+        h.append((now_ts, ce, pe))
+        while h and now_ts - h[0][0] > CHAIN_OI_WINDOW_S + 600:
+            h.pop(0)
+    # 15-min deltas: PE writing at/below spot = support building (bullish
+    # positioning); CE writing at/above spot = resistance building (bearish).
+    sup = res = 0
+    have_window = False
+    for stk, (ce, pe) in strikes_now.items():
+        h = _oi_hist.get(stk, [])
+        past = [x for x in h if now_ts - x[0] >= CHAIN_OI_WINDOW_S - 30]
+        if not past:
+            continue
+        have_window = True
+        _, ce0, pe0 = past[-1]
+        if stk <= atm:
+            sup += max(0, pe - pe0)
+        if stk >= atm:
+            res += max(0, ce - ce0)
+    pe_below_open = sum(max(0, pe - _oi_open[s][1]) for s, (ce, pe) in strikes_now.items()
+                        if s <= atm and s in _oi_open)
+    ce_above_open = sum(max(0, ce - _oi_open[s][0]) for s, (ce, pe) in strikes_now.items()
+                        if s >= atm and s in _oi_open)
+    if not have_window:
+        row.update({"sup_build_15m": "", "res_build_15m": "",
+                    "pe_below_open": pe_below_open, "ce_above_open": ce_above_open,
+                    "oi_state": "warming_up"})
+        _last_oi_state[:] = ["warming_up"]
+        return row
+    # naive observational label; the 2x ratio is a PLACEHOLDER to be replaced by
+    # a data-derived threshold once sessions accumulate. Gates NOTHING.
+    if sup > 2 * res and sup > 0:
+        state = "bullish_positioning"
+    elif res > 2 * sup and res > 0:
+        state = "bearish_positioning"
+    else:
+        state = "mixed"
+    row.update({"sup_build_15m": sup, "res_build_15m": res,
+                "pe_below_open": pe_below_open, "ce_above_open": ce_above_open,
+                "oi_state": state})
+    _last_oi_state[:] = [state]
+    _last_oi_builds[:] = [sup, res]
+    return row
+
+def fetch_postval_candles(state):
+    """END-OF-SESSION (2026-07-18): pull 1-MIN candles for every option contract
+    traded today and save them. WHY: free post-validation until tick infra
+    exists. 1-min OHLC gives TRUE intra-minute high/low — strictly better than
+    our 30s LTP snapshots for verifying MFE/MAE, and the files are a few KB.
+    Must run same-day (before contract expiry drops off the intraday API).
+    Fails soft; never blocks session close."""
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    for key in state.get("traded_keys", []):
+        try:
+            url = (f"https://api.upstox.com/v3/historical-candle/intraday/"
+                   f"{key.replace('|','%7C')}/minutes/1")
+            r = requests.get(url, headers=_h(), timeout=10)
+            if r.status_code == 200 and r.json().get("status") == "success":
+                candles = r.json()["data"]["candles"]
+                safe = key.replace("|", "_").replace(" ", "")
+                fn = f"postval_{TAG}_{d}_{safe}.csv"
+                with open(fn, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["timestamp","open","high","low","close","volume","oi"])
+                    w.writerows(candles)
+                log.info(f"postval: saved {len(candles)} 1-min candles for {key}")
+        except Exception as e:
+            log.warning(f"postval fetch {key}: {e}")
+
+def log_chain(rec):
+    d = datetime.date.today().strftime("%Y-%m-%d")
+    fn = f"chain_{TAG}_{d}.csv"
+    if not os.path.exists(fn):
+        csv.DictWriter(open(fn, "w", newline=""), fieldnames=CHAIN_COLS).writeheader()
+    w = csv.DictWriter(open(fn, "a", newline=""), fieldnames=CHAIN_COLS)
+    w.writerow({c: rec.get(c, "") for c in CHAIN_COLS})
 
 
 def now_ist():
@@ -140,7 +272,9 @@ def send_session_files():
     d = datetime.date.today().strftime("%Y-%m-%d")
     # all v14 files dated today, in a sensible order
     candidates = [f"trade_{TAG}_{d}.csv", f"skip_{TAG}_{d}.csv",
-                  f"open_{TAG}_{d}.csv", f"scan_{TAG}_{d}.csv", f"nifty_{TAG}.log"]
+                  f"open_{TAG}_{d}.csv", f"scan_{TAG}_{d}.csv",
+                  f"chain_{TAG}_{d}.csv"] + \
+                 sorted(glob.glob(f"postval_{TAG}_{d}_*.csv")) + [f"nifty_{TAG}.log"]
     sent = 0
     for fn in candidates:
         if os.path.exists(fn):
@@ -184,6 +318,63 @@ def get_candles(interval=5):
             return df
     except Exception as e:
         log.error(f"candles {interval}: {e}")
+    return None
+
+# ── Nifty FUTURES candles — the only Nifty source with REAL volume ─────────
+# The index (NSE_INDEX|Nifty 50) has NO traded volume, so rvol can't be computed
+# from it (it logged null on every cycle). Futures DO trade and carry volume.
+# Front-month future rolls monthly; we resolve its instrument_key once per day.
+# Fails soft (returns None) so a futures hiccup never disturbs the index-based
+# price logic the bot actually trades on. PAPER-ONLY use (rvol feeds scan log +
+# the paper-only EMAStack detector); live does not log rvol.
+_FUT_KEY_CACHE = {"date": None, "key": None}
+
+def get_nifty_future_key():
+    """Resolve the current near-month Nifty future instrument_key (cached/day)."""
+    today = datetime.date.today()
+    if _FUT_KEY_CACHE["date"] == today and _FUT_KEY_CACHE["key"]:
+        return _FUT_KEY_CACHE["key"]
+    try:
+        # Upstox option/contract endpoint also lists FUT rows for the underlying.
+        r = requests.get("https://api.upstox.com/v2/option/contract",
+                         params={"instrument_key": NIFTY_KEY}, headers=_h(), timeout=10)
+        key = None
+        if r.status_code == 200:
+            rows = r.json().get("data", [])
+            futs = [d for d in rows
+                    if str(d.get("instrument_type", "")).upper() in ("FUT", "FUTIDX")
+                    and d.get("instrument_key")]
+            # nearest expiry future
+            futs = [d for d in futs if d.get("expiry")]
+            if futs:
+                futs.sort(key=lambda d: d["expiry"])
+                key = futs[0]["instrument_key"]
+        _FUT_KEY_CACHE.update({"date": today, "key": key})
+        return key
+    except Exception as e:
+        log.error(f"future key resolve: {e}")
+        return None
+
+def get_future_candles(interval=5):
+    """5-min Nifty FUTURE candles (real volume). None on any failure."""
+    fkey = get_nifty_future_key()
+    if not fkey:
+        return None
+    try:
+        url = f"https://api.upstox.com/v3/historical-candle/intraday/{fkey}/minutes/{interval}"
+        r = requests.get(url, headers=_h(), timeout=10)
+        if r.status_code == 200 and r.json().get("status") == "success":
+            c = r.json()["data"]["candles"]
+            if not c:
+                return None
+            df = pd.DataFrame(c, columns=["timestamp","open","high","low","close","volume","oi"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            for col in ["open","high","low","close","volume","oi"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            return df
+    except Exception as e:
+        log.error(f"future candles {interval}: {e}")
     return None
 
 def get_chain(expiry):
@@ -233,12 +424,15 @@ def current_bid(chain, strike, opt_type):
     return 0
 
 # ── Indicators + signal detection (orchestrate signals.py) ──────────────────
-def compute_indicators(df5, df15, df30):
+def compute_indicators(df5, df15, df30, df5_fut=None):
     ind = {}
     try:
         ind["atr"] = signals.calc_atr(df5)
         ind["rsi"] = signals.calc_rsi(df5)
-        ind["rvol"] = signals.calc_rvol(df5)   # real relative volume (None if n/a)
+        # rvol from FUTURES (index has no volume). None if futures unavailable —
+        # never a fabricated default. Falls back to index df5 (always None) only
+        # so the call is safe; real value comes from df5_fut when present.
+        ind["rvol"] = signals.calc_rvol(df5_fut if df5_fut is not None else df5)
         dfe = signals.calc_ema(df5)
         if "ema9" in dfe.columns:
             ind["e9"] = float(dfe["ema9"].iloc[-1])
@@ -351,13 +545,34 @@ def log_signals_fired(now, ltp, atm, ind, vix, eff, fired, traded_name):
 
 # ── State + logging ──────────────────────────────────────────────────────────
 def load_state():
+    """Load persisted state, resetting SESSION counters on a new day.
+
+    [BUGFIX 2026-09-06] state['date'] was written but never compared, so the
+    saved state accumulated forever. Consequences:
+      • "SESSION DONE ... P&L" reported ALL-TIME P&L, not the session's
+      • the per-exit "Day P&L" line was likewise cumulative
+      • traded_keys grew unbounded, so the post-validation fetcher would
+        re-request every contract ever traded (all long expired) each day
+    'trades' is deliberately NOT reset: trade_no numbering is cumulative
+    across days by design (the logs run #52, #53 ... #92, #93), and resetting
+    it would create duplicate trade numbers across sessions.
+    """
+    today = str(datetime.date.today())
+    s = None
     if os.path.exists("state_v14.json"):
         try:
-            return json.load(open("state_v14.json"))
+            s = json.load(open("state_v14.json"))
         except Exception:
-            pass
-    return {"date": str(datetime.date.today()), "trades":0, "wins":0,
-            "losses":0, "timeouts":0, "pnl":0.0}
+            s = None
+    if s is None:
+        return {"date": today, "trades":0, "wins":0, "losses":0,
+                "timeouts":0, "pnl":0.0, "strat_pnl":{}, "traded_keys":[]}
+    if s.get("date") != today:
+        s.update({"date": today, "wins":0, "losses":0, "timeouts":0,
+                  "pnl":0.0, "strat_pnl":{}, "traded_keys":[]})
+    s.setdefault("strat_pnl", {})
+    s.setdefault("traded_keys", [])
+    return s
 
 def save_state(s):
     try:
@@ -441,10 +656,20 @@ def run():
                         f"expiry {expiry} (front contract not traded)")
         elif no_next_contract:
             roll_txt = "\n🛑 EXPIRY DAY and no next contract found — NOT trading."
+        _cal_ok, _cal_msg = events.calendar_health()
+        if not _cal_ok:
+            log.warning(f"EVENT CALENDAR: {_cal_msg}")
         tg(f"🤖 <b>NIFTY BOT v14 STARTED</b>\nTrading expiry: {expiry} | "
-           f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}")
+           f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}\n"
+           f"━━━━━━━━━━━━━━━\n"
+           f"<b>FLAGS</b> early_kill:ON regime_gate:SMART gap:SMART "
+           f"fvg_cutoff:14:00\n"
+           f"<b>DATA</b> rvol:futures chain_oi:2min\n"
+           f"<b>CAL</b> {_cal_msg}\n"
+           f"(this banner = proof THIS code is running)")
 
     prev_ltp = None   # LTP from the previous scan cycle (for ORPH/ORPL + CPR crosses)
+    _cycle_n = 0      # cycle counter for the chain-OI snapshot cadence (every 4th)
     atr_hist = []     # rolling ATR history for atr_slope: rising ATR = move
                       # building, falling = chop spike dying (chop-discriminator,
                       # measured before wiring into any detector)
@@ -460,11 +685,22 @@ def run():
                                  # must not use a stale date for expiry/events
             if t >= TRADE_END and pos is None:
                 log.info("Session end. Exiting.")
+                # [BUGFIX 2026-09-06] postval MUST run regardless of Telegram
+                # state — it is data collection, not a notification. It was
+                # previously nested inside `if tg_on()`, so with TG disabled the
+                # 1-min post-validation candles were silently never fetched.
+                # Must run same-day: the intraday candle API drops expired
+                # contracts after the session.
+                fetch_postval_candles(state)
                 if tg_on():
                     wr = state["wins"]/state["trades"]*100 if state["trades"] else 0
+                    _sb = state.get("strat_pnl", {})
+                    _sline = "\n".join(f"  {k}: Rs.{v:+.0f}" for k,v in
+                                         sorted(_sb.items(), key=lambda x:-x[1])) or "  (none)"
                     tg(f"📊 <b>SESSION DONE</b>\nTrades {state['trades']} | "
                        f"W{state['wins']} L{state['losses']} T{state['timeouts']} | "
-                       f"WR {wr:.0f}%\nP&L Rs.{state['pnl']:+.0f}")
+                       f"WR {wr:.0f}%\nP&L Rs.{state['pnl']:+.0f}\n"
+                       f"<b>By strategy:</b>\n{_sline}")
                     send_session_files()   # [REQUEST] deliver today's logs
                 save_state(state)
                 break
@@ -484,11 +720,23 @@ def run():
             if df30 is None or len(df30) < 3:
                 df30 = df5
 
-            ind = compute_indicators(df5, df15, df30)
+            # FUTURES candles for real volume (rvol). Fails soft -> None.
+            df5_fut = get_future_candles(5)
+            ind = compute_indicators(df5, df15, df30, df5_fut=df5_fut)
             vix = feeds.get_india_vix()
             atm = int(round(ltp/50)*50)
             closes = df5["close"].astype(float).tolist()[-30:]
             gap_pct = feeds.compute_gap_pct(df5["open"].iloc[0] if len(df5) else ltp, prev_ohlc)
+
+            # ── CHAIN-OI SNAPSHOT (observational; every ~2min; fails soft) ──
+            _cycle_n += 1
+            if _cycle_n % CHAIN_OI_EVERY_N == 1:
+                try:
+                    _oi_chain = get_chain(expiry)
+                    if _oi_chain:
+                        log_chain(snapshot_chain_oi(_oi_chain, atm, ltp, time.time()))
+                except Exception as e:
+                    log.warning(f"chain-oi snapshot: {e}")
 
             # [FIX 2] track the day's observed ATR range for relative trend gating
             _atr_now = ind.get("atr", 0)
@@ -539,6 +787,8 @@ def run():
                     f"<b>ATR</b> {ind.get('atr',0):.1f} (day {day_atr_low:.0f}–{day_atr_high:.0f}) | "
                     f"<b>eff</b> {eff:.2f}\n"
                     f"<b>RSI</b> {ind.get('rsi',0):.0f} | <b>VIX</b> {vix}\n"
+                    f"<b>OI</b> {_last_oi_state[0] if _last_oi_state else 'n/a'}"
+                    f"{(' (sup+' + str(_last_oi_builds[0]) + ' res+' + str(_last_oi_builds[1]) + ')') if _last_oi_builds else ''}\n"
                     f"<b>EMA</b> 9:{e9:.0f} 21:{e21:.0f} 50:{e50:.0f}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"Trades {state['trades']} (W{state['wins']} L{state['losses']} T{state['timeouts']}) "
@@ -588,6 +838,9 @@ def run():
                         result = "timeout"
                     state["wins" if result=="win" else "losses" if result=="loss" else "timeouts"] += 1
                     state["pnl"] += pnl
+                    state.setdefault("strat_pnl", {})
+                    state["strat_pnl"][pos.strategy] = \
+                        state["strat_pnl"].get(pos.strategy, 0) + pnl
                     cap.on_result(reason, pnl); lock.record(pos.strategy, reason)
                     log_trade({
                         "trade_no":pos.trade_no, "ts":getattr(pos,"entry_ts_str",now.strftime("%Y-%m-%d %H:%M:%S")),
@@ -629,7 +882,10 @@ def run():
                         e = "✅" if pnl>=0 else "❌"
                         tg(f"{e} <b>EXIT #{pos.trade_no} {reason.upper()}</b>\n"
                            f"{pos.strategy} {pos.direction}\nRs.{pos.entry_premium:.2f}→{sell:.2f} "
-                           f"= Rs.{pnl:+.0f} ({pts:+.1f})\n{dur:.1f}min")
+                           f"= Rs.{pnl:+.0f} ({pts:+.1f})\n{dur:.1f}min | "
+                           f"MFE {pos.mfe_pts:.1f} MAE {pos.mae_pts:.1f}\n"
+                           f"<b>Day P&L Rs.{state['pnl']:+.0f}</b> "
+                           f"({state['wins']}W {state['losses']}L {state['timeouts']}T)")
                     log.info(f"EXIT #{pos.trade_no} {result} Rs.{pnl:+.0f}")
                     save_state(state)
                     pos = None
@@ -681,6 +937,11 @@ def run():
                         smart_gap_filter=True,  # PAPER test (2026-06-24): smarter
                         # gap-opposition (allow gap-opposing entries in CLEAN trends,
                         # penalise only in chop). Live keeps blunt rule (default False).
+                        fvg_afternoon_cutoff=True,  # PAPER test (2026-07-17): FVG
+                        # after 14:00 = 1/12, -11,033 across 6 days both books.
+                        smart_regime_gate=True,  # PAPER test (2026-06-25): efficiency-
+                        # aware regime gate (allow trend strats on efficient tape the
+                        # label calls CHOPPY). Live keeps blunt rule (default False).
                     )
                     if not decision.enter:
                         # Blocked signal -> dedicated skip log (per request).
@@ -697,7 +958,8 @@ def run():
                         decision.plan["target_mode"] = decision.target_mode
                         pos = LongOptionPosition(
                             trade_no, sig_name, direction, ltp, quote,
-                            decision.plan, lots, ind)
+                            decision.plan, lots, ind,
+                            early_kill_mfe=True)   # PAPER-ONLY shadow (2026-06-25)
                         pos.confidence = conf   # record entry confidence for analysis
                         pos.entry_v2 = dict(v2)   # v2 state AT ENTRY (shadow; for validation join)
                         traded_signal = sig_name   # mark which signal actually traded
@@ -708,13 +970,22 @@ def run():
                         # [FIX 1] write an OPEN row immediately so a restart or
                         # crash mid-trade can never make the position vanish.
                         log_open(pos, decision, vix)
+                        # track instrument for end-of-day 1-min post-validation pull
+                        state.setdefault("traded_keys", [])
+                        if quote.instr_key and quote.instr_key not in state["traded_keys"]:
+                            state["traded_keys"].append(quote.instr_key)
                         if tg_on():
                             e = "🟢" if direction=="bullish" else "🔴"
+                            _er = signals.efficiency_ratio(closes)
+                            _oi_st = _last_oi_state[0] if _last_oi_state else "n/a"
                             tg(f"{e} <b>ENTRY #{trade_no} {sig_name}</b>\n{direction.upper()} "
                                f"{opt_type} {quote.strike}\nBuy Rs.{pos.entry_premium:.2f} "
                                f"SL {pos.sl_price:.2f} Tgt {pos.target_price:.2f}\n"
                                f"size {decision.size_mult:.2f}({lots}lot) hold {pos.hold_min:.0f}m "
-                               f"VIX {vix}")
+                               f"conf {conf}/10\n"
+                               f"<b>CTX</b> eff {_er:.2f} | ATR {ind.get('atr',0):.0f} | "
+                               f"{ind.get('regime','?')} | VIX {vix}\n"
+                               f"<b>OI</b> {_oi_st}")
                         log.info(f"ENTRY #{trade_no} {sig_name} {direction} {opt_type}{quote.strike} "
                                  f"@{pos.entry_premium:.2f} size{decision.size_mult:.2f}")
                         save_state(state)

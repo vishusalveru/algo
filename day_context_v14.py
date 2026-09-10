@@ -30,6 +30,12 @@ import signals   # single source of truth for all classification
 
 # ── Decision-only thresholds (POLICY, not classification) ───────────────────
 EXPIRY_STOP       = datetime.time(13, 0)   # no new entries after 1pm on expiry
+FVG_AFTERNOON_STOP = datetime.time(14, 0)  # PAPER TEST (2026-07-17): FVG entered
+                                           # after 14:00 is 1/12, Rs.-11,033 across
+                                           # 6 days in BOTH books (direct realised
+                                           # P&L, incl. live 07-17 -1680, 06-05
+                                           # -904). Late FVG breaks = exhaustion +
+                                           # theta; they never develop (MFE 0-0.8).
 TRADE_OPEN_SETTLE = datetime.time(9, 45)   # skip opening 30m of unstable ATR
 LUNCH_START       = datetime.time(12, 0)
 LUNCH_END         = datetime.time(13, 0)
@@ -82,6 +88,12 @@ def classify_day_context(
     smart_gap_filter: bool = False,      # PAPER-ONLY test (2026-06-24): smarter
                                          # gap-opposition (see §4). Live leaves
                                          # this False = unchanged blunt behaviour.
+    smart_regime_gate: bool = False,     # PAPER-ONLY test (2026-06-25): efficiency-
+                                         # aware regime gate (see §6b). Live leaves
+                                         # this False = unchanged blunt behaviour.
+    fvg_afternoon_cutoff: bool = False,  # PAPER-ONLY test (2026-07-17): block FVG
+                                         # entries after 14:00 (see FVG_AFTERNOON_STOP).
+                                         # Live leaves this False = unchanged.
 ) -> DayContext:
     """Turn signals.py classifications into a trade decision for this moment."""
 
@@ -90,6 +102,12 @@ def classify_day_context(
     # ── 1. SESSION-TIME GATE ───────────────────────────────────────────────
     if now_time < TRADE_OPEN_SETTLE:
         return ctx.block(f"pre-{TRADE_OPEN_SETTLE} open: ATR unstable")
+
+    # ── 1b. FVG AFTERNOON CUTOFF (PAPER-ONLY flag; see FVG_AFTERNOON_STOP) ─
+    if fvg_afternoon_cutoff and strategy_name == "StrongFVG" \
+            and now_time >= FVG_AFTERNOON_STOP:
+        return ctx.block(f"FVG past {FVG_AFTERNOON_STOP}: late-FVG 1/12 "
+                         f"Rs.-11k across 6 days (exhaustion+theta)")
 
     # ── 2. EXPIRY-DAY THETA REGIME (uses signals.is_expiry_day) ────────────
     expiry_today = signals.is_expiry_day(today, nearest_expiry)
@@ -157,8 +175,24 @@ def classify_day_context(
     # ── 6b. REGIME GATE (uses signals.REGIME_BLOCK_TREND) ──────────────────
     is_trend_strat = signals.is_trend_strategy(strategy_name)
     if is_trend_strat and regime in signals.REGIME_BLOCK_TREND:
-        return ctx.block(f"{strategy_name} trend-type but regime={regime} "
-                         f"(live WR poor here)")
+        if smart_regime_gate:
+            # PAPER TEST (2026-06-25): audit_regime_block showed the blunt gate
+            # blocked 192 BOS across 20 sessions, and 33% of those (7 distinct
+            # setups) fired on EFFICIENT tape (efficiency>=MIN_EFFICIENCY) the
+            # label merely called CHOPPY. BOS is the system's edge (83% WR), so
+            # killing efficient-tape BOS is the same leak the gap filter had.
+            # FIX: the regime LABEL is coarse; trust the continuous efficiency
+            # metric. Block only when regime says block AND efficiency also
+            # confirms chop. On efficient tape, let the trend strat through.
+            er_now = signals.efficiency_ratio(recent_closes)
+            if er_now < MIN_EFFICIENCY:
+                return ctx.block(f"{strategy_name} trend-type, regime={regime} "
+                                 f"AND chop (er{er_now:.2f}<{MIN_EFFICIENCY})")
+            ctx.reasons.append(f"{strategy_name} regime={regime} but efficient "
+                               f"tape (er{er_now:.2f}) — allowed")
+        else:
+            return ctx.block(f"{strategy_name} trend-type but regime={regime} "
+                             f"(live WR poor here)")
 
     # ── 6c. ATR MOMENTUM FILTER (uses signals.trend_atr_ok — relative) ─────
     if is_trend_strat:

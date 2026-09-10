@@ -62,6 +62,13 @@ CAPTURE_FRAC = 0.45
 TRAIL_ARM_FRAC = 0.50    # arm only after +50% of the way to target
 TRAIL_GIVEBACK = 0.60    # trail at entry + 60% of the gain (give back 40%)
 
+# ── MFE EARLY-KILL thresholds (2026-06-25, PAPER-ONLY by default) ──────────
+# Derived from 69-trade paper history: timeout losers almost never showed
+# >3pts MFE by the 5-min mark, while genuine winners developed earlier. A
+# trade still flat (MFE<3) at 5min is cut instead of riding to a full timeout.
+EARLY_KILL_MARK_MIN = 5.0    # checkpoint minute
+EARLY_KILL_MFE_MIN  = 3.0    # MFE-so-far below this at the mark = cut
+
 # IV richness guard: if current IV is this multiple above the baseline,
 # treat premium as expensive and require a bigger edge.
 IV_RICH_MULT = 1.35
@@ -276,7 +283,8 @@ class LongOptionPosition:
 
     def __init__(self, trade_no, strategy, direction, entry_nifty,
                  quote: OptionQuote, plan: dict, lots: int,
-                 indicators: dict, start_ts: float | None = None):
+                 indicators: dict, start_ts: float | None = None,
+                 early_kill_mfe: bool = False):
         self.trade_no = trade_no
         self.strategy = strategy
         self.direction = direction          # "bullish"->CE, "bearish"->PE
@@ -316,6 +324,16 @@ class LongOptionPosition:
         self.mfe_at_2min = None
         self.mfe_at_5min = None
         self.mfe_at_10min = None
+        # ── MFE EARLY-KILL (2026-06-25, PAPER-ONLY shadow) ─────────────────
+        # Backtest on 69-trade history: a trade still showing MFE<3pts at the
+        # 5-min mark is a "dead-on-arrival" timeout loser 13/14 of the time.
+        # Cutting it at 5min (instead of riding the full hold to timeout) saved
+        # ~Rs.9.6k of the -16k timeout bleed while risking ONE +36 winner.
+        # OFF by default so LIVE behaviour is unchanged; the paper bot sets
+        # early_kill_mfe=True. The threshold/mark below are the backtested edge.
+        self.early_kill_mfe = early_kill_mfe
+        self.early_kill_mark_min = EARLY_KILL_MARK_MIN
+        self.early_kill_mfe_min = EARLY_KILL_MFE_MIN
         # confidence the trade entered with (set by the bot after construction)
         self.confidence = indicators.get("confidence", 0)
 
@@ -378,6 +396,18 @@ class LongOptionPosition:
         ts = getattr(self, "trail_stop", 0.0)
         if ts >= self.entry_premium and ts > 0 and sell_price <= ts:
             return "trail", sell_price, dur_min
+
+        # ── MFE EARLY-KILL (PAPER-ONLY; off in live) ───────────────────────
+        # If, by the checkpoint minute, the trade still hasn't developed any
+        # meaningful favorable excursion, it is almost certainly a slow timeout
+        # loser. Cut it now at the current (small) loss rather than bleeding the
+        # full hold. Only fires AFTER target/sl/trail have been checked above,
+        # so a trade that's actually working is never killed by this.
+        if (self.early_kill_mfe
+                and dur_min >= self.early_kill_mark_min
+                and self.mfe_pts < self.early_kill_mfe_min
+                and sell_price <= self.entry_premium):   # not in profit
+            return "early_kill", sell_price, dur_min
 
         # Time stop — with the [FIX 3] extension.
         if dur_min >= self.hold_min:

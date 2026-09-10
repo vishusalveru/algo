@@ -124,6 +124,8 @@ def decide_entry(
     atr_day_low: float = 0.0,
     atr_day_high: float = 0.0,
     smart_gap_filter: bool = False,   # PAPER-ONLY gap-filter test; default off = live unchanged
+    smart_regime_gate: bool = False,  # PAPER-ONLY regime-gate test; default off = live unchanged
+    fvg_afternoon_cutoff: bool = False,  # PAPER-ONLY FVG 14:00 cutoff; default off = live unchanged
 ) -> Decision:
     """Run the full gate chain. Returns a Decision with an audit trail."""
     d = Decision()
@@ -144,6 +146,8 @@ def decide_entry(
         strong_breakout=strong_breakout, regime=regime, strategy_name=strategy_name,
         atr_day_low=atr_day_low, atr_day_high=atr_day_high,
         smart_gap_filter=smart_gap_filter,
+        smart_regime_gate=smart_regime_gate,
+        fvg_afternoon_cutoff=fvg_afternoon_cutoff,
     )
     d.reasons.extend([f"ctx: {r}" for r in ctx.reasons])
     d.day_type = ctx.day_type
