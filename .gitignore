@@ -1,0 +1,11 @@
+config.py
+*.csv
+*.log
+*.out
+*.pid
+*.pidnohup
+*.json
+*.zip
+__pycache__/
+venv/
+nyse_bot/
