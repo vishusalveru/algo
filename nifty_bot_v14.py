@@ -113,31 +113,68 @@ CHAIN_OI_EVERY_N = 4          # every 4th 30s cycle ≈ 2 minutes
 CHAIN_OI_WINDOW_S = 900       # 15-min rolling delta window
 CHAIN_COLS = ["datetime","nifty_ltp","atm"] + \
     [f"s_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
-    ["sup_build_15m","res_build_15m","pe_below_open","ce_above_open","oi_state"]
+    [f"v_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
+    [f"g_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
+    ["sup_build_15m","res_build_15m","pe_below_open","ce_above_open","oi_state",
+     "atm_vol_total","atm_vol_z","net_gex","gex_regime"]
 
 _oi_hist = {}    # absolute strike -> list[(ts, ce_oi, pe_oi)], pruned to ~25min
 _oi_open = {}    # absolute strike -> (ce_oi, pe_oi) first seen today
 _last_oi_state = []  # [state_str] — most recent oi_state for TG/entry context
 _last_oi_builds = []  # [sup_build_15m, res_build_15m] — for TG scan display
+_atm_vol_hist = []   # rolling ATM CE+PE volume, for the spike z-score
+_gex_hist = []       # rolling net-GEX, for the session-relative regime label
 
 def snapshot_chain_oi(chain, atm, ltp, now_ts):
     """Extract ATM±3 OI, update history, compute positioning deltas.
     OBSERVATIONAL: returns a log row; nothing gates on it. None-safe throughout —
     a missing strike/row simply logs blank (no fabricated values)."""
-    row = {"datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    # [BUGFIX 2026-09-11] was datetime.now() = system UTC, while every other log
+    # is IST. The 5:30 offset made the chain log impossible to join to trades/
+    # scans — which is the whole point of it. Now uses the same IST clock.
+    row = {"datetime": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
            "nifty_ltp": ltp, "atm": atm}
     offsets = {"m3": -150, "m2": -100, "m1": -50, "atm": 0, "p1": 50, "p2": 100, "p3": 150}
     strikes_now = {}
+    vols_now = {}
+    gam_now = {}
     by_strike = {r.get("strike_price"): r for r in (chain or [])}
     for lab, off in offsets.items():
         stk = atm + off
         r = by_strike.get(stk) or by_strike.get(float(stk))
-        ce = pe = None
+        ce = pe = cv = pv = cg = pg = None
         if r:
-            ce = ((r.get("call_options") or {}).get("market_data") or {}).get("oi")
-            pe = ((r.get("put_options") or {}).get("market_data") or {}).get("oi")
+            cmd = (r.get("call_options") or {}).get("market_data") or {}
+            pmd = (r.get("put_options") or {}).get("market_data") or {}
+            cgk = (r.get("call_options") or {}).get("option_greeks") or {}
+            pgk = (r.get("put_options") or {}).get("option_greeks") or {}
+            ce, pe = cmd.get("oi"), pmd.get("oi")
+            cv, pv = cmd.get("volume"), pmd.get("volume")
+            cg, pg = cgk.get("gamma"), pgk.get("gamma")
         row[f"s_{lab}_ce"] = ce if ce is not None else ""
         row[f"s_{lab}_pe"] = pe if pe is not None else ""
+        # [ADDED 2026-09-11] per-strike VOLUME. 09-11 postval analysis: the
+        # -1164 BOS loss entered on a 99th-percentile, 6.8x-median volume
+        # minute (bought the top of a discharged spike); the winner entered at
+        # the 1st percentile with volume BUILDING after. Index has no volume
+        # and futures is only a proxy — the OPTION's own volume is the direct
+        # measure, and it is already in this chain payload. OBSERVATIONAL.
+        row[f"v_{lab}_ce"] = cv if cv is not None else ""
+        row[f"v_{lab}_pe"] = pv if pv is not None else ""
+        if cv is not None and pv is not None:
+            vols_now[stk] = (int(cv), int(pv))
+        # [ADDED 2026-09-16] per-strike GAMMA. Already in the option_greeks
+        # payload we parse for delta/iv — we were discarding it. Enables a crude
+        # net-GEX series. HYPOTHESIS ONLY (GEX literature is SPX/0DTE and
+        # contested; Cboe's own research disputes the effect size, and "dealers
+        # are net short" is an assumption OI cannot confirm). Logged to test ONE
+        # falsifiable question against our own trades: do BOS trades win on
+        # high-|GEX| days and lose on vol-suppressed days, while mean-reversion
+        # strategies do the reverse? Gates NOTHING.
+        row[f"g_{lab}_ce"] = cg if cg is not None else ""
+        row[f"g_{lab}_pe"] = pg if pg is not None else ""
+        if cg is not None and pg is not None and ce is not None and pe is not None:
+            gam_now[stk] = (float(cg), float(pg), int(ce), int(pe))
         if ce is not None and pe is not None:
             strikes_now[stk] = (int(ce), int(pe))
     # update history + day-open baseline (keyed by ABSOLUTE strike so ATM drift
@@ -167,6 +204,47 @@ def snapshot_chain_oi(chain, atm, ltp, now_ts):
                         if s <= atm and s in _oi_open)
     ce_above_open = sum(max(0, ce - _oi_open[s][0]) for s, (ce, pe) in strikes_now.items()
                         if s >= atm and s in _oi_open)
+    # ATM volume spike detector: current ATM CE+PE volume vs its own rolling
+    # history this session. z>~2 = the "entering into a discharged spike" case.
+    atm_vol = None
+    if atm in vols_now:
+        atm_vol = vols_now[atm][0] + vols_now[atm][1]
+        _atm_vol_hist.append(atm_vol)
+        if len(_atm_vol_hist) > 60:
+            _atm_vol_hist.pop(0)
+    row["atm_vol_total"] = atm_vol if atm_vol is not None else ""
+    if atm_vol is not None and len(_atm_vol_hist) >= 10:
+        import statistics as _st
+        m = _st.mean(_atm_vol_hist); sd = _st.pstdev(_atm_vol_hist)
+        row["atm_vol_z"] = round((atm_vol - m) / sd, 2) if sd > 0 else ""
+    else:
+        row["atm_vol_z"] = ""
+
+    # NET GEX (sign convention: dealers assumed short calls / long puts — the
+    # standard retail assumption, NOT verifiable from OI. Units are arbitrary
+    # and only the SIGN and relative magnitude are meaningful.)
+    net_gex = None
+    if gam_now:
+        net_gex = sum(cg * ceoi - pg * peoi for cg, pg, ceoi, peoi in gam_now.values())
+        row["net_gex"] = round(net_gex, 2)
+        _gex_hist.append(net_gex)
+        if len(_gex_hist) > 60:
+            _gex_hist.pop(0)
+        # label relative to THIS session's own distribution — no hardcoded
+        # threshold (the literature's levels are SPX-scaled and would not
+        # transfer to Nifty).
+        if len(_gex_hist) >= 10:
+            import statistics as _s2
+            md = _s2.median(_gex_hist)
+            row["gex_regime"] = ("pos_gamma_vol_suppressed" if net_gex > 0
+                                 else "neg_gamma_vol_amplified")
+            row["gex_regime"] += "_above_med" if net_gex > md else "_below_med"
+        else:
+            row["gex_regime"] = "warming_up"
+    else:
+        row["net_gex"] = ""
+        row["gex_regime"] = ""
+
     if not have_window:
         row.update({"sup_build_15m": "", "res_build_15m": "",
                     "pe_below_open": pe_below_open, "ce_above_open": ce_above_open,
