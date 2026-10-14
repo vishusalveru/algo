@@ -1,0 +1,83 @@
+2026-10-14 12:15:27,180 [INFO] FVG gap-bound block: bullish gap 23510.0-23540.0 ltp 23495.0 is BELOW the gap (failed) age:3c
+
+D2 — live BOS gate on a CLEAN trend, old inputs vs release inputs (same detector, same gates):
+  time      dir |     OLD regime     OLD |     NEW regime     NEW | NEW reason
+09:45  bullish |        UNKNOWN   block |        UNKNOWN   block | BLOCK: day context
+10:10  bullish |        UNKNOWN   block |        UNKNOWN   block | BLOCK: day context
+10:15  bullish |         CHOPPY   block |  TRENDING_BULL   ENTER | size 1.00
+10:30  bullish |         CHOPPY   block |  TRENDING_BULL   ENTER | size 1.00
+11:30  bullish |         CHOPPY   block |  TRENDING_BULL   ENTER | size 1.00
+12:30  bullish |         CHOPPY   block |  TRENDING_BULL   ENTER | size 0.70
+13:15  bullish |         CHOPPY   block |  TRENDING_BULL   ENTER | size 1.00
+14:00  bullish |  TRENDING_BULL   ENTER |  TRENDING_BULL   ENTER | size 1.00
+09:45  bearish |        UNKNOWN   block |        UNKNOWN   block | BLOCK: day context
+10:10  bearish |        UNKNOWN   block |        UNKNOWN   block | BLOCK: day context
+10:15  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 1.00
+10:30  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 1.00
+11:30  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 1.00
+12:30  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 0.70
+13:15  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 1.00
+14:00  bearish |  TRENDING_BEAR   ENTER |  TRENDING_BEAR   ENTER | size 1.00
+
+====================================================================================================
+V0   FIXED                Release files are the 2026-10-14 release
+                         RELEASE="2026-10-14", LIVE_FIX seeded+fvg_in_gap True, MODE="live"
+C1   FIXED                Stop decided by the BROKER SL-M, never by a 0/missing bid
+                         chain_none PASS; bid_at_stop_broker_fills_later PASS; sl_filled_between_polls PASS
+C2   FIXED                Exit = confirmed cancel -> sell -> confirmed fill; failure keeps a stop
+                         cancel_fails_once PASS; sell_rejected_once PASS; sell_outcome_unknown PASS
+C3   FIXED                SL-M placement failure -> confirmed flatten + halt
+                         sl_place_fails_flatten PASS
+C4   FIXED                Unconfirmed entry cancelled and read back (late / partial fill)
+                         entry_fills_late PASS; entry_partial_fill PASS
+H1   FIXED                Position managed during LTP/candle/chain outage, incl. backstop
+                         ltp_outage_while_open PASS; backstop_no_bid PASS
+H2   FIXED                Daily SL stop / halt survive a restart
+                         restart_after_two_sls PASS; no_funds_restart_same_day PASS
+H3   FIXED                Startup refuses on API error or pending F&O order
+                         startup_positions_error PASS; startup_pending_order PASS
+N1   FIXED                [found in review] position closed by hand in Upstox is never sold again
+                         manual_close_stop_cancelled PASS; manual_close_stop_resting PASS
+N2   FIXED                [no-funds test] rejected entries -> 3 tries -> halt, no sells
+                         no_funds_rejected_after_place PASS; no_funds_place_error PASS
+N3   FIXED                MOCK mode exits at target and at stop
+                         mock_target PASS; mock_sl PASS
+D1   FIXED                Previous close = last session strictly before IST today
+                         API newest-first and oldest-first both give 2026-10-13 close 23400
+D2   FIXED                Bullish BOS before 13:25 is no longer blocked by a bearish-biased regime
+                         clean up-trend -> TRENDING_BULL + ENTER at every check 10:15-14:00 (old code blocked 5/5 bullish checks before 13:25); down-trend unchanged -> TRENDING_BEAR + ENTER. 09:45-10:10: BOS blocked in BOTH directions (regime needs 12 of today's candles) — same as before, now symmetric
+D3   FIXED                No placeholder ATR 20 / RSI 50 at the open; entries blocked if history is missing
+                         09:45 with yesterday: ATR 31.4 RSI 96.6 (81 candles); without: 6 candles -> blocked (live + paper)
+D4a  FIXED                no_next guard compares like with like (string)
+                         both bots compare nearest_expiry to today.strftime('%Y-%m-%d')
+D4b  FIXED                atm_vol_z measures per-minute volume, not the day-cumulative total
+                         z-score of volume/min between snapshots at the same ATM strike
+D4c  FIXED                Futures/rvol lookup no longer re-downloads the contract list every cycle
+                         'not found' is cached for the day (path itself still finds nothing)
+D4d  FIXED                FVG entry must still be INSIDE the gap (live AND paper)
+                         price went THROUGH the gap: old -> signal, release -> none; price INSIDE the gap: old -> signal, release -> signal
+D4e  NOT IN THIS RELEASE  FVG 'strong' flag honoured (both bots still trade every FVG)
+                         strategy change: needs fvg_replay.py results (strong x inside/through) first
+D4f  NOT IN THIS RELEASE  Expiry-day rules (13:00 cutoff etc.) — still OFF since the 06-02 roll
+                         kept as-is on purpose: data since the roll says harmless (BOS 2/2 after 13:00 on expiry)
+P2a  FIXED                Paper trades 1 lot like live
+                         MAX_LOTS = 1
+P2b  NOT IN THIS RELEASE  Paper: BOS-first priority, exhaustion filter, no 14:30 force-close, blunt gates
+                         paper is the experiment book; a true live shadow = the MOCK live copy in ~/livemock (DEPLOY 6b)
+L1   FIXED                Live SL exit logs the broker's REAL fill
+                         SL row uses the SL-M average price (scenario C1 checks 78.6)
+L2   FIXED                Paper session win rate uses today's trades only
+                         wins / (wins+losses+timeouts) today
+L3   FIXED                Paper trade columns: true regime and VIX at entry
+                         new columns entry_regime_label, entry_vix (old columns kept for comparability)
+L4   FIXED                Signal with no tradeable quote leaves a skip row (paper + live)
+                         skip row written
+L5   FIXED                Net-GEX comment matches the formula
+                         comment corrected; formula unchanged
+L6   FIXED                Live writes a skip log for every blocked signal
+                         live_skip_<date>.csv
+L7   NOT IN THIS RELEASE  Telegram OI net-change / concentration line
+                         visibility feature, not a defect; next release
+====================================================================================================
+25 fixed, 0 FAILED, 4 not in this release (by decision)
+RELEASE VERIFIED

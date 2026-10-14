@@ -66,7 +66,7 @@ HARD_CLOSE = datetime.time(15, 10)
 SCAN_SLEEP = 30                 # seconds between cycles
 TAG = "v14"                     # filename tag (constant)
 TELEGRAM_SCAN_INTERVAL = 300    # 5-min market scan alerts
-MAX_LOTS = 2
+MAX_LOTS = 1   # [2026-10-14] was 2; 1 lot = a true shadow of live
 MIN_OI = 50000
 MIN_QTY = 25
 MAX_SPREAD_PCT = 0.08
@@ -92,7 +92,11 @@ TRADE_COLS = ["trade_no","ts","strategy","direction","entry_nifty","entry_premiu
               # v2 state AT ENTRY (shadow instrumentation, audit fix B 2026-06-11)
               "entry_v2_strength","entry_v2_momentum","entry_v2_r2",
               # post-hoc analysis fields (2026-06-16) — for later correlation work
-              "entry_gap_pct","stop_efficiency","mfe_to_mae_ratio"]
+              "entry_gap_pct","stop_efficiency","mfe_to_mae_ratio",
+              # [2026-10-14] audit 4.4: 'entry_regime' has always held the TREND and
+              # 'vix' the VIX at EXIT (kept unchanged for comparability). The true
+              # values at entry are now logged here:
+              "entry_regime_label","entry_vix"]
 # [FIX 1] OPEN log: written at entry so an interrupted trade is never lost.
 OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
              "entry_premium","lots","sl","target","hold_min","strike","opt_type",
@@ -122,7 +126,8 @@ _oi_hist = {}    # absolute strike -> list[(ts, ce_oi, pe_oi)], pruned to ~25min
 _oi_open = {}    # absolute strike -> (ce_oi, pe_oi) first seen today
 _last_oi_state = []  # [state_str] — most recent oi_state for TG/entry context
 _last_oi_builds = []  # [sup_build_15m, res_build_15m] — for TG scan display
-_atm_vol_hist = []   # rolling ATM CE+PE volume, for the spike z-score
+_atm_vol_hist = []   # rolling ATM CE+PE volume PER MINUTE, for the spike z-score
+_atm_vol_last = []   # [(atm_strike, cumulative_volume, ts)] previous snapshot
 _gex_hist = []       # rolling net-GEX, for the session-relative regime label
 
 def snapshot_chain_oi(chain, atm, ltp, now_ts):
@@ -206,23 +211,33 @@ def snapshot_chain_oi(chain, atm, ltp, now_ts):
                         if s >= atm and s in _oi_open)
     # ATM volume spike detector: current ATM CE+PE volume vs its own rolling
     # history this session. z>~2 = the "entering into a discharged spike" case.
+    # [FIX 2026-10-14] chain `volume` is DAY-CUMULATIVE (verified 09-21: rises
+    # every snapshot, drops only when the ATM strike changes). z-scoring the
+    # running total measured the clock (corr -0.62 with time, -0.02 with price
+    # moves). Now: volume traded PER MINUTE between snapshots at the SAME ATM
+    # strike (corr +0.44 with |price move|/min on 09-21), then a rolling z.
     atm_vol = None
     if atm in vols_now:
         atm_vol = vols_now[atm][0] + vols_now[atm][1]
-        _atm_vol_hist.append(atm_vol)
-        if len(_atm_vol_hist) > 60:
-            _atm_vol_hist.pop(0)
+        prev = _atm_vol_last[0] if _atm_vol_last else None
+        if prev and prev[0] == atm and now_ts > prev[2] and atm_vol >= prev[1]:
+            _atm_vol_hist.append((atm_vol - prev[1]) / ((now_ts - prev[2]) / 60.0))
+            if len(_atm_vol_hist) > 20:
+                _atm_vol_hist.pop(0)
+        _atm_vol_last[:] = [(atm, atm_vol, now_ts)]
     row["atm_vol_total"] = atm_vol if atm_vol is not None else ""
-    if atm_vol is not None and len(_atm_vol_hist) >= 10:
+    if len(_atm_vol_hist) >= 10:
         import statistics as _st
         m = _st.mean(_atm_vol_hist); sd = _st.pstdev(_atm_vol_hist)
-        row["atm_vol_z"] = round((atm_vol - m) / sd, 2) if sd > 0 else ""
+        row["atm_vol_z"] = round((_atm_vol_hist[-1] - m) / sd, 2) if sd > 0 else ""
     else:
         row["atm_vol_z"] = ""
 
-    # NET GEX (sign convention: dealers assumed short calls / long puts — the
-    # standard retail assumption, NOT verifiable from OI. Units are arbitrary
-    # and only the SIGN and relative magnitude are meaningful.)
+    # NET GEX = sum(call_gamma*call_OI - put_gamma*put_OI). [2026-10-14 comment
+    # corrected, formula unchanged] This sign convention assumes dealers are LONG
+    # calls / SHORT puts (customers sell calls, buy puts) — the standard
+    # SqueezeMetrics-style assumption, NOT verifiable from OI. Positive = dealers
+    # long gamma (vol-suppressing). Units arbitrary; only SIGN and relative size matter.
     net_gex = None
     if gam_now:
         net_gex = sum(cg * ceoi - pg * peoi for cg, pg, ceoi, peoi in gam_now.values())
@@ -410,7 +425,10 @@ _FUT_KEY_CACHE = {"date": None, "key": None}
 def get_nifty_future_key():
     """Resolve the current near-month Nifty future instrument_key (cached/day)."""
     today = datetime.date.today()
-    if _FUT_KEY_CACHE["date"] == today and _FUT_KEY_CACHE["key"]:
+    # [FIX 2026-10-14] cache "no key" too — it never finds one (option/contract
+    # lists options only), and re-downloading the contract list every 30s cycle
+    # wasted API calls on the token live also uses.
+    if _FUT_KEY_CACHE["date"] == today:
         return _FUT_KEY_CACHE["key"]
     try:
         # Upstox option/contract endpoint also lists FUT rows for the underlying.
@@ -502,16 +520,24 @@ def current_bid(chain, strike, opt_type):
     return 0
 
 # ── Indicators + signal detection (orchestrate signals.py) ──────────────────
-def compute_indicators(df5, df15, df30, df5_fut=None):
+def compute_indicators(df5, df15, df30, df5_fut=None, df_prev=None):
+    """[2026-10-14] ATR / RSI / EMA (and the RSI series + EMA frames the
+    detectors use) are computed on PREVIOUS SESSION + TODAY (same as live), so
+    they are real from the open: no ATR 20 / RSI 50 placeholders before ~10:20,
+    no missing EMAs before ~13:25 (which made the regime unable to say
+    TRENDING_BULL). VWAP, trend and the regime window stay on TODAY."""
     ind = {}
     try:
-        ind["atr"] = signals.calc_atr(df5)
-        ind["rsi"] = signals.calc_rsi(df5)
+        seed = feeds.seeded_frame(df_prev, df5)
+        ind["hist_candles"] = len(seed)
+        ind["df_seed"] = seed
+        ind["atr"] = signals.calc_atr(seed)
+        ind["rsi"] = signals.calc_rsi(seed)
         # rvol from FUTURES (index has no volume). None if futures unavailable —
         # never a fabricated default. Falls back to index df5 (always None) only
         # so the call is safe; real value comes from df5_fut when present.
         ind["rvol"] = signals.calc_rvol(df5_fut if df5_fut is not None else df5)
-        dfe = signals.calc_ema(df5)
+        dfe = signals.calc_ema(seed)
         if "ema9" in dfe.columns:
             ind["e9"] = float(dfe["ema9"].iloc[-1])
             ind["e21"] = float(dfe["ema21"].iloc[-1])
@@ -525,8 +551,11 @@ def compute_indicators(df5, df15, df30, df5_fut=None):
         trend, _, strength = signals.detect_trend_multi(
             df5, df15, df30, ind.get("e9",0), ind.get("e21",0), ind.get("e50",0), 0)
         ind["t5"], ind["trend"], ind["trend_strength"] = t5, trend, strength
-        ind["regime"] = signals.classify_intraday_regime(
-            df5, ind.get("e9",0), ind.get("e21",0), ind.get("atr",30))
+        if "e9" in ind:
+            ind["regime"] = signals.classify_intraday_regime(
+                df5, ind.get("e9",0), ind.get("e21",0), ind.get("atr",30))
+        else:
+            ind["regime"] = "UNKNOWN"   # never classify from zero EMAs (bearish bias)
     except Exception as e:
         log.error(f"indicators: {e}")
     return ind
@@ -542,7 +571,7 @@ def detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct=0.0, prev_ltp=None):
     trend = ind.get("trend","neutral")
     fired = []   # every detector that fired, in priority order
     try:
-        fvg, _ = signals.detect_fvg(df5)
+        fvg, _ = signals.detect_fvg(df5, require_in_gap=True)   # [2026-10-14] same as live
         if fvg:
             fired.append(("StrongFVG", fvg.get("type"), True))
         bos, _ = signals.detect_bos(df5, ltp)
@@ -555,13 +584,14 @@ def detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct=0.0, prev_ltp=None):
         st, _ = signals.detect_supertrend_signal(df5, trend, ltp, atr)
         if st:
             fired.append(("SuperTrend", st.get("type"), False))
-        rdiv, _ = signals.detect_rsi_divergence(df5, signals.calc_rsi_series(df5))
+        _seed = ind.get("df_seed", df5)
+        rdiv, _ = signals.detect_rsi_divergence(_seed, signals.calc_rsi_series(_seed))
         if rdiv:
             fired.append(("RSIDivergence", rdiv.get("type"), False))
         # ── Tier 1 revived detectors (paper only) [2026-06-08] ──
         # EMACross: needs current EMA frame + prior-candle EMA frame to see a cross.
-        if "df_ema" in ind and len(df5) >= 51:
-            prev_dfe = signals.calc_ema(df5.iloc[:-1])
+        if "df_ema" in ind and len(_seed) >= 51:
+            prev_dfe = signals.calc_ema(_seed.iloc[:-1])
             if "ema9" in prev_dfe.columns:
                 xc, _ = signals.detect_ema_cross(ind["df_ema"], prev_dfe)
                 if xc:
@@ -721,7 +751,9 @@ def run():
     prev_ohlc = feeds.get_prev_day_ohlc()
     today = datetime.date.today()
     ev_today, ev_label = events.is_event_day(today)
-    no_next_contract = (rolled is False and nearest_expiry == today
+    # [FIX 2026-10-14] nearest_expiry is a string; comparing it to a date object
+    # meant this guard could never fire.
+    no_next_contract = (rolled is False and nearest_expiry == today.strftime("%Y-%m-%d")
                         and expiry == nearest_expiry)
 
     if tg_on():
@@ -741,12 +773,15 @@ def run():
            f"VIX open: {vix_open}{roll_txt}{ev_txt}{up_txt}\n"
            f"━━━━━━━━━━━━━━━\n"
            f"<b>FLAGS</b> early_kill:ON regime_gate:SMART gap:SMART "
-           f"fvg_cutoff:14:00\n"
+           f"fvg_cutoff:14:00 fvg_in_gap:ON seeded:ON lots:{MAX_LOTS}\n"
+           f"<b>PREV</b> {('close %.0f (%s)' % (prev_ohlc['close'], prev_ohlc.get('date','?'))) if prev_ohlc else 'UNAVAILABLE'}\n"
            f"<b>DATA</b> rvol:futures chain_oi:2min\n"
            f"<b>CAL</b> {_cal_msg}\n"
            f"(this banner = proof THIS code is running)")
 
     prev_ltp = None   # LTP from the previous scan cycle (for ORPH/ORPL + CPR crosses)
+    df_prev = None    # [2026-10-14] previous session 5-min candles (indicator warm-up)
+    _last_seed_try = 0.0
     _cycle_n = 0      # cycle counter for the chain-OI snapshot cadence (every 4th)
     atr_hist = []     # rolling ATR history for atr_slope: rising ATR = move
                       # building, falling = chop spike dying (chop-discriminator,
@@ -771,7 +806,8 @@ def run():
                 # contracts after the session.
                 fetch_postval_candles(state)
                 if tg_on():
-                    wr = state["wins"]/state["trades"]*100 if state["trades"] else 0
+                    _n_day = state["wins"] + state["losses"] + state["timeouts"]
+                    wr = state["wins"]/_n_day*100 if _n_day else 0   # [FIX 2026-10-14] was ÷ all-time trades
                     _sb = state.get("strat_pnl", {})
                     _sline = "\n".join(f"  {k}: Rs.{v:+.0f}" for k,v in
                                          sorted(_sb.items(), key=lambda x:-x[1])) or "  (none)"
@@ -800,7 +836,14 @@ def run():
 
             # FUTURES candles for real volume (rvol). Fails soft -> None.
             df5_fut = get_future_candles(5)
-            ind = compute_indicators(df5, df15, df30, df5_fut=df5_fut)
+            # [2026-10-14] previous session candles for indicator warm-up
+            if df_prev is None and prev_ohlc and prev_ohlc.get("date") \
+                    and time.time() - _last_seed_try > 300:
+                _last_seed_try = time.time()
+                df_prev = feeds.get_session_candles(prev_ohlc["date"], 5)
+                log.info(f"indicator warm-up: {prev_ohlc['date']} = "
+                         f"{0 if df_prev is None else len(df_prev)} candles")
+            ind = compute_indicators(df5, df15, df30, df5_fut=df5_fut, df_prev=df_prev)
             vix = feeds.get_india_vix()
             atm = int(round(ltp/50)*50)
             closes = df5["close"].astype(float).tolist()[-30:]
@@ -928,6 +971,8 @@ def run():
                         "target_mode":pos.plan.get("target_mode","pct"), "hold_min":pos.hold_min,
                         "day_type":pos.plan.get("day_type",""), "entry_rsi":round(pos.entry_rsi,1),
                         "entry_atr":round(pos.entry_atr,1), "entry_regime":pos.entry_trend,
+                        "entry_regime_label":getattr(pos,"entry_regime_label",""),
+                        "entry_vix":getattr(pos,"entry_vix",""),
                         "vix":vix, "strike":pos.option_strike, "opt_type":pos.option_type,
                         "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
                         "spread":round(pos.option_spread,2),
@@ -995,6 +1040,13 @@ def run():
                 # Expiry day with no next contract to roll to — do not trade.
                 if sig_name:
                     log.info(f"Signal {sig_name} but expiry day + no next contract — skipped")
+            elif sig_name and ind.get("hist_candles", 0) < 14:
+                # [2026-10-14] never enter on placeholder ATR/RSI (same as live)
+                log_skip({"datetime": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                          "signal": sig_name, "direction": direction,
+                          "regime": ind.get("regime", ""), "atr": ind.get("atr", ""),
+                          "vix": vix, "size": 0,
+                          "reasons": f"BLOCK: only {ind.get('hist_candles', 0)} candles — ATR/RSI would be placeholders"})
             elif sig_name and direction in ("bullish","bearish"):
                 opt_type = "CE" if direction=="bullish" else "PE"
                 chain = get_chain(expiry)
@@ -1044,6 +1096,8 @@ def run():
                         # [FIX 2] stamp the real ENTRY time on the position so it
                         # is never overwritten by the exit time later.
                         pos.entry_ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+                        pos.entry_regime_label = ind.get("regime", "")   # [2026-10-14] audit 4.4
+                        pos.entry_vix = vix
                         state["trades"] += 1
                         # [FIX 1] write an OPEN row immediately so a restart or
                         # crash mid-trade can never make the position vanish.
@@ -1067,6 +1121,14 @@ def run():
                         log.info(f"ENTRY #{trade_no} {sig_name} {direction} {opt_type}{quote.strike} "
                                  f"@{pos.entry_premium:.2f} size{decision.size_mult:.2f}")
                         save_state(state)
+                else:
+                    # [2026-10-14] audit 4.4: a signal with no tradeable quote used
+                    # to vanish without a skip row.
+                    log_skip({"datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+                              "signal": sig_name, "direction": direction,
+                              "regime": ind.get("regime", ""), "atr": round(ind.get("atr", 0), 1),
+                              "vix": vix, "size": 0,
+                              "reasons": "BLOCK: no tradeable quote (chain/strike unavailable)"})
 
             # Log every scan with the decision audit trail
             # (v2 computed earlier this iteration, before entry detection)

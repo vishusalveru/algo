@@ -482,8 +482,14 @@ def is_trend_strategy(strategy_name):
 #  SIGNAL DETECTORS (12 total)
 # ─────────────────────────────────────────────────────────────────────────
 
-def detect_fvg(df):
-    """Fair Value Gap — fresh gap with intact zone."""
+def detect_fvg(df, require_in_gap=False):
+    """Fair Value Gap — fresh gap with intact zone.
+
+    require_in_gap [2026-10-14]: the entry trigger only checked the gap's NEAR
+    edge (bullish: ltp < candle-3 low), never the FAR edge (candle-1 high). So a
+    bullish entry could fire after price fell clean THROUGH the gap — a failed
+    FVG — as long as the current candle bounced green. With require_in_gap=True
+    the entry must still be INSIDE the gap. Blocks are logged (INFO)."""
     if df is None or len(df) < 3:
         return None, "No candles"
     candles = df.tail(15)
@@ -514,6 +520,10 @@ def detect_fvg(df):
             continue
         if c1h < c3l:
             if ltp_now < c3l and last_up:   # GUARD: price confirming UP, not failing down
+                if require_in_gap and ltp_now < c1h:
+                    log.info(f"FVG gap-bound block: bullish gap {c1h:.1f}-{c3l:.1f} "
+                             f"ltp {ltp_now:.1f} is BELOW the gap (failed) age:{age}c")
+                    continue
                 size = round(c3l - c1h, 1)
                 if size < MIN_FVG_SIZE:
                     continue
@@ -525,6 +535,10 @@ def detect_fvg(df):
                 }, f"{'STRONG' if strong else 'WEAK'} Bull FVG {size:.1f}pts age:{age}c"
         if c1l > c3h:
             if ltp_now > c3h and last_down:   # GUARD: price confirming DOWN, not failing up
+                if require_in_gap and ltp_now > c1l:
+                    log.info(f"FVG gap-bound block: bearish gap {c3h:.1f}-{c1l:.1f} "
+                             f"ltp {ltp_now:.1f} is ABOVE the gap (failed) age:{age}c")
+                    continue
                 size = round(c1l - c3h, 1)
                 if size < MIN_FVG_SIZE:
                     continue
