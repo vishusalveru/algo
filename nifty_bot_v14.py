@@ -96,13 +96,16 @@ TRADE_COLS = ["trade_no","ts","strategy","direction","entry_nifty","entry_premiu
               # [2026-10-14] audit 4.4: 'entry_regime' has always held the TREND and
               # 'vix' the VIX at EXIT (kept unchanged for comparability). The true
               # values at entry are now logged here:
-              "entry_regime_label","entry_vix"]
+              "entry_regime_label","entry_vix",
+              # [2026-10-22] full-chain OI bias AT ENTRY (observational)
+              "entry_oi_bias","entry_oi_basis"]
 # [FIX 1] OPEN log: written at entry so an interrupted trade is never lost.
 OPEN_COLS = ["trade_no","entry_ts","strategy","direction","entry_nifty",
              "entry_premium","lots","sl","target","hold_min","strike","opt_type",
              "iv","delta","vix","size_mult","confidence"]
 # Skip log: blocked signals broken out separately (per request) for easy review.
-SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reasons"]
+SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reasons",
+             "oi_bias","oi_basis"]   # [2026-10-22] observational
 
 # ── CHAIN-OI SNAPSHOT (2026-07-17, PAPER-ONLY, OBSERVATIONAL) ───────────────
 # WHY: 07-17 whipsaw — bearish PE 14:02 (SL -1680) then bullish CE 14:21
@@ -115,12 +118,17 @@ SKIP_COLS = ["datetime","signal","direction","regime","atr","vix","size","reason
 # every CHAIN_OI_EVERY_N cycles (~2min) — captures every batch, minimal cost.
 CHAIN_OI_EVERY_N = 4          # every 4th 30s cycle ≈ 2 minutes
 CHAIN_OI_WINDOW_S = 900       # 15-min rolling delta window
+# [2026-10-22] FULL-CHAIN OI totals + bias (owner request). OBSERVATIONAL: gates nothing.
+OI_TOTAL_COLS = ["oi_basis","oi_basis_since","prev_oi_coverage","ce_oi_total_lots","pe_oi_total_lots",
+                 "ce_oi_chg_lots","pe_oi_chg_lots","oi_net_lots","oi_net_pct","oi_bias","pcr_total",
+                 "oi_big_jump"]
 CHAIN_COLS = ["datetime","nifty_ltp","atm"] + \
     [f"s_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
     [f"v_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
     [f"g_{o}_{s}" for o in ("m3","m2","m1","atm","p1","p2","p3") for s in ("ce","pe")] + \
     ["sup_build_15m","res_build_15m","pe_below_open","ce_above_open","oi_state",
-     "atm_vol_total","atm_vol_z","net_gex","gex_regime"]
+     "atm_vol_total","atm_vol_z","net_gex","gex_regime"] + \
+    OI_TOTAL_COLS
 
 _oi_hist = {}    # absolute strike -> list[(ts, ce_oi, pe_oi)], pruned to ~25min
 _oi_open = {}    # absolute strike -> (ce_oi, pe_oi) first seen today
@@ -280,6 +288,157 @@ def snapshot_chain_oi(chain, atm, ltp, now_ts):
     _last_oi_state[:] = [state]
     _last_oi_builds[:] = [sup, res]
     return row
+
+# ── FULL-CHAIN OI TOTALS + BIAS [2026-10-22, owner request; OBSERVATIONAL] ──
+# Owner: the 15-min "sup/res" line hides the big picture. Show TOTAL call OI and
+# TOTAL put OI for the whole chain with their CHANGE, plus a weak/moderate/strong
+# bull/bear label. Study (claude/OI_BIAS_2026-10-22.md, 11 sessions): the SIGN of
+# (PE change - CE change) called the next 30 min right 64% vs 59% for price trend;
+# the SIZE did not add accuracy and a bias that flipped <10 min ago was right only
+# 54% -> tiers are DESCRIPTIVE (recalibrate after a week), fresh flips are WEAK.
+# CHANGE BASIS (owner rule): Upstox `prev_oi` (previous close) when it is present
+# for >= OI_PREV_MIN_COVERAGE of the strike-sides that have OI; otherwise change
+# since the bot's first snapshot today (baseline persisted, survives restarts).
+# The basis is shown in every alert and logged on every row. Never mixed.
+OI_LOT_QTY = 65                 # Nifty lot size (qty per lot)
+OI_PREV_MIN_COVERAGE = 0.95
+OI_TIER_MODERATE_PCT = 3.0      # |net| as % of total OI (provisional)
+OI_TIER_STRONG_PCT = 8.0
+OI_FRESH_FLIP_S = 600           # direction flipped < 10 min ago -> WEAK
+OI_BIG_JUMP_LOTS = 8000         # one strike-side moving >= this between snapshots (~top 1%)
+BASIS_UPSTOX, BASIS_START = "UPSTOX_PREV_CLOSE", "BOT_START"
+_oi_tot = {}        # latest totals dict (for TG / signal rows)
+_oi_flip = {}       # {"sign": int, "since": ts}
+_oi_prev_snap = {}  # (strike, side) -> oi at previous snapshot (big-jump detector)
+_oi_big_since_tg = []   # biggest jump since the last 5-min TG line
+
+def _oi_baseline_file():
+    return f"oi_baseline_{now_ist():%Y-%m-%d}.json"
+
+def _oi_load_baseline():
+    try:
+        if os.path.exists(_oi_baseline_file()):
+            return json.load(open(_oi_baseline_file()))
+    except Exception as e:
+        log.warning(f"oi baseline unreadable: {e}")
+    return {"since": None, "oi": {}}
+
+def _oi_save_baseline(b):
+    try:
+        json.dump(b, open(_oi_baseline_file(), "w"))
+    except Exception as e:
+        log.warning(f"oi baseline save failed: {e}")
+
+def _num(x):
+    try:
+        return None if x is None or x == "" else float(x)
+    except (TypeError, ValueError):
+        return None
+
+def compute_oi_totals(chain, now_ts):
+    """Full-chain CE/PE OI totals, change (basis per owner rule), bias label.
+    Returns a dict of OI_TOTAL_COLS values (+ display helpers). Never raises."""
+    out = {c: "" for c in OI_TOTAL_COLS}
+    rows = []
+    for r in chain or []:
+        k = _num(r.get("strike_price"))
+        if k is None:
+            continue
+        for side, key in (("ce", "call_options"), ("pe", "put_options")):
+            md = (r.get(key) or {}).get("market_data") or {}
+            oi = _num(md.get("oi"))
+            if oi is None:
+                continue
+            rows.append((k, side, oi, _num(md.get("prev_oi"))))
+    if not rows:
+        return out
+    ce_tot = sum(oi for _, s, oi, _ in rows if s == "ce")
+    pe_tot = sum(oi for _, s, oi, _ in rows if s == "pe")
+    with_oi = [x for x in rows if x[2] > 0]
+    have_prev = [x for x in with_oi if x[3] is not None]
+    coverage = len(have_prev) / len(with_oi) if with_oi else 0.0
+    prev_sum = sum(x[3] for x in rows if x[3] is not None)
+    if with_oi and coverage >= OI_PREV_MIN_COVERAGE and prev_sum > 0:
+        basis, since = BASIS_UPSTOX, "prev close"
+        ce_chg = sum(oi - (p or 0) for _, s, oi, p in rows if s == "ce")
+        pe_chg = sum(oi - (p or 0) for _, s, oi, p in rows if s == "pe")
+    else:
+        basis = BASIS_START
+        b = _oi_load_baseline()
+        changed = False
+        if not b.get("since"):
+            b["since"] = now_ist().strftime("%H:%M"); changed = True
+        for k, s, oi, _ in rows:                    # strikes first seen later start from then
+            key = f"{int(k)}_{s}"
+            if key not in b["oi"]:
+                b["oi"][key] = oi; changed = True
+        if changed:
+            _oi_save_baseline(b)
+        since = f"bot start {b['since']}"
+        ce_chg = sum(oi - b["oi"].get(f"{int(k)}_ce", oi) for k, s, oi, _ in rows if s == "ce")
+        pe_chg = sum(oi - b["oi"].get(f"{int(k)}_pe", oi) for k, s, oi, _ in rows if s == "pe")
+    net = pe_chg - ce_chg                           # >0: more puts added than calls -> BULL
+    total = ce_tot + pe_tot
+    pct = (net / total * 100.0) if total > 0 else 0.0
+    sign = 1 if net > 0 else -1 if net < 0 else 0
+    if _oi_flip.get("sign") != sign:
+        _oi_flip.update({"sign": sign, "since": now_ts})
+    if sign == 0:
+        label = "NEUTRAL"
+    else:
+        tier = ("STRONG" if abs(pct) >= OI_TIER_STRONG_PCT else
+                "MODERATE" if abs(pct) >= OI_TIER_MODERATE_PCT else "WEAK")
+        if now_ts - _oi_flip.get("since", now_ts) < OI_FRESH_FLIP_S:
+            tier = "WEAK"                            # fresh flip: unreliable (54% in the study)
+        label = f"{tier} {'BULL' if sign > 0 else 'BEAR'}"
+    # big single strike-side jump since the previous snapshot (observational)
+    big = None
+    for k, s, oi, _ in rows:
+        p = _oi_prev_snap.get((k, s))
+        if p is not None:
+            d_lots = (oi - p) / OI_LOT_QTY
+            if abs(d_lots) >= OI_BIG_JUMP_LOTS and (big is None or abs(d_lots) > abs(big[2])):
+                big = (int(k), s.upper(), d_lots)
+        _oi_prev_snap[(k, s)] = oi
+    if big:
+        txt = f"{big[0]}{big[1]} {big[2]/1000:+.1f}k lots @{now_ist():%H:%M}"
+        if not _oi_big_since_tg or abs(big[2]) > abs(_oi_big_since_tg[0][1]):
+            _oi_big_since_tg[:] = [(txt, big[2])]
+    L = lambda q: round(q / OI_LOT_QTY / 1e5, 2)    # quantity -> lakh lots
+    out.update({"oi_basis": basis, "oi_basis_since": since, "prev_oi_coverage": round(coverage, 3),
+                "ce_oi_total_lots": L(ce_tot), "pe_oi_total_lots": L(pe_tot),
+                "ce_oi_chg_lots": L(ce_chg), "pe_oi_chg_lots": L(pe_chg),
+                "oi_net_lots": L(net), "oi_net_pct": round(pct, 2), "oi_bias": label,
+                "pcr_total": round(pe_tot / ce_tot, 2) if ce_tot > 0 else "",
+                "oi_big_jump": f"{big[0]}{big[1]} {big[2]:+.0f}" if big else ""})
+    prev_basis = _oi_tot.get("oi_basis")
+    _oi_tot.clear(); _oi_tot.update(out)
+    if prev_basis and prev_basis != basis:
+        tg(f"⚠️ <b>OI basis switched</b> {prev_basis} → {basis} "
+           f"(prev_oi coverage {coverage*100:.0f}%). Changes now measured from {since}.")
+        log.warning(f"OI basis switched {prev_basis} -> {basis} (coverage {coverage:.2f})")
+    return out
+
+def oi_bias_now():
+    return _oi_tot.get("oi_bias", "")
+
+def oi_basis_now():
+    return _oi_tot.get("oi_basis", "")
+
+def oi_tg_line():
+    """5-min Telegram line in the owner's format. Empty-safe."""
+    if not _oi_tot or _oi_tot.get("oi_bias", "") == "":
+        return "<b>OI</b> n/a (no chain yet)"
+    t = _oi_tot
+    basis = "Upstox prev close" if t["oi_basis"] == BASIS_UPSTOX else t["oi_basis_since"]
+    line = (f"<b>OI</b> [{basis}]\n"
+            f"   CE {t['ce_oi_total_lots']:.2f}L ({t['ce_oi_chg_lots']:+.2f}L) | "
+            f"PE {t['pe_oi_total_lots']:.2f}L ({t['pe_oi_chg_lots']:+.2f}L)\n"
+            f"   <b>{t['oi_bias']}</b> (PE−CE {t['oi_net_lots']:+.2f}L, {t['oi_net_pct']:+.1f}%) | PCR {t['pcr_total']}")
+    if _oi_big_since_tg:
+        line += f"\n   big move: {_oi_big_since_tg[0][0]}"
+        _oi_big_since_tg.clear()
+    return line
 
 def fetch_postval_candles(state):
     """END-OF-SESSION (2026-07-18): pull 1-MIN candles for every option contract
@@ -631,7 +790,8 @@ def detect_signal(df5, df15, ind, ltp, prev_ohlc, gap_pct=0.0, prev_ltp=None):
 
 # ── All-fired-signal log (audit fix B): unbiased per-strategy sample ────────
 SIGNALS_COLS = ["datetime","nifty_ltp","atm","regime","atr","rsi","vix",
-                "efficiency","signal","direction","strong","priority_pick","traded"]
+                "efficiency","signal","direction","strong","priority_pick","traded",
+                "oi_bias","oi_basis"]   # [2026-10-22] observational
 
 def log_signals_fired(now, ltp, atm, ind, vix, eff, fired, traded_name):
     """Log EVERY detector that fired this cycle, not just the one traded.
@@ -649,6 +809,7 @@ def log_signals_fired(now, ltp, atm, ind, vix, eff, fired, traded_name):
             "rsi": round(ind.get("rsi",0),1), "vix": vix, "efficiency": eff,
             "signal": name, "direction": direction, "strong": strong,
             "priority_pick": (i == 0), "traded": (name == traded_name),
+            "oi_bias": oi_bias_now(), "oi_basis": oi_basis_now(),
         })
 
 # ── State + logging ──────────────────────────────────────────────────────────
@@ -722,6 +883,7 @@ def log_open(pos, decision, vix):
 def log_skip(rec):
     """Blocked signals, broken out separately for easy review (per request)."""
     d = datetime.date.today().strftime("%Y-%m-%d")
+    rec.setdefault("oi_bias", oi_bias_now()); rec.setdefault("oi_basis", oi_basis_now())
     w = csv.DictWriter(open(f"skip_{TAG}_{d}.csv","a",newline=""), fieldnames=SKIP_COLS)
     w.writerow({c: rec.get(c,"") for c in SKIP_COLS})
 
@@ -855,7 +1017,13 @@ def run():
                 try:
                     _oi_chain = get_chain(expiry)
                     if _oi_chain:
-                        log_chain(snapshot_chain_oi(_oi_chain, atm, ltp, time.time()))
+                        _now_ts = time.time()
+                        _row = snapshot_chain_oi(_oi_chain, atm, ltp, _now_ts)
+                        try:
+                            _row.update(compute_oi_totals(_oi_chain, _now_ts))
+                        except Exception as e:
+                            log.warning(f"oi totals: {e}")
+                        log_chain(_row)
                 except Exception as e:
                     log.warning(f"chain-oi snapshot: {e}")
 
@@ -908,8 +1076,7 @@ def run():
                     f"<b>ATR</b> {ind.get('atr',0):.1f} (day {day_atr_low:.0f}–{day_atr_high:.0f}) | "
                     f"<b>eff</b> {eff:.2f}\n"
                     f"<b>RSI</b> {ind.get('rsi',0):.0f} | <b>VIX</b> {vix}\n"
-                    f"<b>OI</b> {_last_oi_state[0] if _last_oi_state else 'n/a'}"
-                    f"{(' (sup+' + str(_last_oi_builds[0]) + ' res+' + str(_last_oi_builds[1]) + ')') if _last_oi_builds else ''}\n"
+                    f"{oi_tg_line()}\n"
                     f"<b>EMA</b> 9:{e9:.0f} 21:{e21:.0f} 50:{e50:.0f}\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"Trades {state['trades']} (W{state['wins']} L{state['losses']} T{state['timeouts']}) "
@@ -973,6 +1140,8 @@ def run():
                         "entry_atr":round(pos.entry_atr,1), "entry_regime":pos.entry_trend,
                         "entry_regime_label":getattr(pos,"entry_regime_label",""),
                         "entry_vix":getattr(pos,"entry_vix",""),
+                        "entry_oi_bias":getattr(pos,"entry_oi_bias",""),
+                        "entry_oi_basis":getattr(pos,"entry_oi_basis",""),
                         "vix":vix, "strike":pos.option_strike, "opt_type":pos.option_type,
                         "iv":round(pos.option_iv,2), "delta":round(pos.option_delta,3),
                         "spread":round(pos.option_spread,2),
@@ -1098,6 +1267,7 @@ def run():
                         pos.entry_ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
                         pos.entry_regime_label = ind.get("regime", "")   # [2026-10-14] audit 4.4
                         pos.entry_vix = vix
+                        pos.entry_oi_bias = oi_bias_now(); pos.entry_oi_basis = oi_basis_now()
                         state["trades"] += 1
                         # [FIX 1] write an OPEN row immediately so a restart or
                         # crash mid-trade can never make the position vanish.
@@ -1109,7 +1279,8 @@ def run():
                         if tg_on():
                             e = "🟢" if direction=="bullish" else "🔴"
                             _er = signals.efficiency_ratio(closes)
-                            _oi_st = _last_oi_state[0] if _last_oi_state else "n/a"
+                            _oi_st = (f"{oi_bias_now()} [{'Upstox' if oi_basis_now() == BASIS_UPSTOX else 'since start'}]"
+                                      if oi_bias_now() else "n/a")
                             tg(f"{e} <b>ENTRY #{trade_no} {sig_name}</b>\n{direction.upper()} "
                                f"{opt_type} {quote.strike}\nBuy Rs.{pos.entry_premium:.2f} "
                                f"SL {pos.sl_price:.2f} Tgt {pos.target_price:.2f}\n"
