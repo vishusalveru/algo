@@ -40,6 +40,7 @@ import event_calendar_v14 as events
 from decision_layer_v14 import decide_entry, CapitalLadder, ReentryLockout
 from trade_engine_v14 import OptionQuote, LongOptionPosition, sell_fill_from_bid
 from live_execution import LiveExecutor
+import adaptive_gate as AG
 
 # ─────────────────────────────────────────────────────────────────────────
 MODE = "live"          # 'live' = REAL ORDERS | 'mock' = dry-run, no orders
@@ -52,10 +53,16 @@ MAX_SL_HITS_PER_DAY = 2 # daily stop: 2 stop-loss hits -> done
 # monitor-before-fetch, persisted day state, fail-closed startup) are ALWAYS on.
 # These two change WHICH trades are taken; each is a switch so its effect can
 # be measured separately. Owner decision 2026-10-14: both ON in live.
-RELEASE = "2026-10-14"
+RELEASE = "2026-11-05"
 LIVE_FIX = {
     "seeded_indicators": True,   # ATR/RSI/EMA on prev session + today (D2/D3)
     "fvg_require_in_gap": True,  # FVG entry must still be inside its gap
+    # ── Release 2026-11-05 (owner decisions 4 Nov) ──
+    "early_kill": True,          # at 5 min: MFE < 3 pts and not in profit -> confirmed exit
+                                 # (same rule as paper; paper cut the 4-Nov SL trade at -712)
+    "adaptive_bos": True,        # rule B: BOS floor = 0.9 x ref ATR (10 paper sessions) and
+                                 # skip BOS when ATR >= 35 with efficiency < 0.30
+    "bos_scorecard": True,       # start-up Telegram WARNING from paper logs; never blocks a trade
 }
 
 logging.basicConfig(level=logging.INFO,
@@ -374,6 +381,22 @@ def run():
     no_next = (rolled is False and nearest_expiry == today.strftime("%Y-%m-%d")
                and expiry == nearest_expiry)
 
+    # [2026-11-05] rule B: set the BOS ATR floor from the paper bot's last 10 sessions.
+    # Scorecard first (it replays past days with their own floors, then restores).
+    score_txt = ""
+    if LIVE_FIX["bos_scorecard"]:
+        sc_res, sc_err = AG.bos_scorecard(".", today)
+        score_txt = AG.scorecard_text(sc_res, sc_err)
+        log.info(score_txt.replace("\n", " | "))
+    adapt_txt = ""
+    if LIVE_FIX["adaptive_bos"]:
+        ref_atr, ref_info = AG.reference_atr(".", today)
+        AG.apply_floor(ref_atr)
+        adapt_txt = AG.startup_line(ref_atr, ref_info)
+    else:
+        signals.ATR_ABS_FLOOR = AG.FIXED_FLOOR
+    log.info(adapt_txt or f"adaptive BOS off: fixed floor {signals.ATR_ABS_FLOOR}")
+
     prev_txt = (f"prev close {prev_ohlc['close']:.0f} ({prev_ohlc.get('date','?')})"
                 if prev_ohlc else "prev close UNAVAILABLE (gap gate off)")
     log.info(f"startup: expiry {expiry} rolled={rolled} | {prev_txt} | restored day state "
@@ -385,7 +408,8 @@ def run():
        f"Expiry {expiry} | VIX {vix_open} | {prev_txt}\n"
        f"1 lot | 20% SL (broker) | daily stop {MAX_SL_HITS_PER_DAY} SLs\n"
        f"FIX: broker-SL authority, confirmed exits, seeded={LIVE_FIX['seeded_indicators']}, "
-       f"fvg_in_gap={LIVE_FIX['fvg_require_in_gap']}\n"
+       f"fvg_in_gap={LIVE_FIX['fvg_require_in_gap']}, early_kill={LIVE_FIX['early_kill']}\n"
+       f"{adapt_txt + chr(10) if adapt_txt else ''}{score_txt + chr(10) if score_txt else ''}"
        f"Today so far: trades {trade_no} | SL hits {sl_hits_today} | P&L Rs.{day_pnl:+.0f}"
        f"{roll_txt}{halt_txt}")
 
@@ -593,7 +617,9 @@ def run():
                         "stop_efficiency":(round(abs(pnl_pts)/abs(pos.entry_premium-pos.sl_price),2)
                                            if pnl<0 and pos.entry_premium!=pos.sl_price else "")})
                     e = "✅" if pnl >= 0 else "❌"
-                    tg(f"{e} <b>LIVE EXIT #{pos.trade_no} {reason.upper()}</b> ({pos.strategy})\n"
+                    why_txt = ("EARLY EXIT — no move in first 5 min" if reason == "early_kill"
+                               else reason.upper())
+                    tg(f"{e} <b>LIVE EXIT #{pos.trade_no} {why_txt}</b> ({pos.strategy})\n"
                        f"{pos.option_type}{pos.option_strike} {pos.entry_premium:.1f}→{actual_exit:.1f} "
                        f"= Rs.{pnl:+.0f}\nSL hits today: {sl_hits_today}")
                     log.info(f"EXIT #{pos.trade_no} {result} {exit_kind} Rs.{pnl:+.0f} (sl_hits={sl_hits_today})")
@@ -623,6 +649,15 @@ def run():
                 log_live_skip(sig_name, direction, ind, ltp, vix,
                               f"BLOCK: only {ind.get('hist_candles', 0)} candles — ATR/RSI would be placeholders")
                 time.sleep(SCAN_SLEEP); continue
+
+            # [2026-11-05] rule B spike block: BOS in a volatility spike on choppy tape
+            if LIVE_FIX["adaptive_bos"]:
+                blk, blk_why = AG.spike_block(sig_name, ind.get("atr"), ind.get("efficiency"))
+                if blk:
+                    if _throttled("spike", 300):
+                        log.info(f"BOS {direction} skipped — {blk_why}")
+                    log_live_skip(sig_name, direction, ind, ltp, vix, f"BLOCK: {blk_why}; detector: {sig_detail}")
+                    time.sleep(SCAN_SLEEP); continue
 
             opt_type = "CE" if direction=="bullish" else "PE"
             chain = get_chain(expiry)
@@ -728,7 +763,8 @@ def run():
             plan2["reasons"]=list(decision.reasons) + ([f"detector: {sig_detail}"] if sig_detail else [])
             plan2["day_type"]=decision.day_type
             plan2["target_mode"]=decision.target_mode
-            pos = LongOptionPosition(trade_no, sig_name, direction, ltp, quote, plan2, 1, ind)
+            pos = LongOptionPosition(trade_no, sig_name, direction, ltp, quote, plan2, 1, ind,
+                                     early_kill_mfe=LIVE_FIX["early_kill"])
             pos.confidence=conf; pos.actual_fill=actual_fill
             pos.computed_entry=plan["entry_price"]   # keep the pre-fill estimate
             pos.entry_ts_str=now.strftime("%Y-%m-%d %H:%M:%S")

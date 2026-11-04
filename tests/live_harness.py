@@ -9,7 +9,7 @@ scenario controls exactly when a trade happens; execution is entirely real.
     python3 live_harness.py <scenario>      # one scenario, prints PASS/FAIL
     python3 live_harness.py all             # every scenario, each in a fresh process
 """
-import os, sys, json, subprocess, datetime as dt, tempfile, shutil
+import os, re, sys, json, subprocess, datetime as dt, tempfile, shutil
 
 RELEASE = os.environ.get("RELEASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCENARIOS = ["normal_target", "chain_none", "bid_at_stop_broker_fills_later",
@@ -20,7 +20,10 @@ SCENARIOS = ["normal_target", "chain_none", "bid_at_stop_broker_fills_later",
              "ltp_outage_while_open", "backstop_no_bid",
              "manual_close_stop_cancelled", "manual_close_stop_resting",
              "no_funds_rejected_after_place", "no_funds_place_error", "no_funds_restart_same_day",
-             "mock_target", "mock_sl"]
+             "mock_target", "mock_sl",
+             # release 2026-11-05
+             "early_kill_cut", "early_kill_not_after_mfe", "early_kill_not_in_profit", "early_kill_flag_off",
+             "spike_block_bos", "spike_ok_when_efficient", "adaptive_startup_from_logs", "adaptive_no_logs_fallback"]
 
 if len(sys.argv) > 1 and sys.argv[1] == "all":
     ok = True
@@ -295,6 +298,40 @@ elif SC in ("no_funds_rejected_after_place", "no_funds_place_error", "no_funds_r
 elif SC in ("mock_target", "mock_sl"):
     B.MODE = "mock"                                  # dry-run: executor never calls the broker
     SCRIPT.on_cycle = price_path({5: 112} if SC == "mock_target" else {5: 79.0})
+# ── release 2026-11-05 scenarios ────────────────────────────────────────────
+# entry fill = 100.3 (prem 100 + 0.3); 5 minutes = 10 bot cycles after entry (cycle 2)
+elif SC == "early_kill_cut":
+    SCRIPT.on_cycle = price_path({3: 99.5})          # never moves in our favour
+elif SC == "early_kill_not_after_mfe":
+    SCRIPT.on_cycle = price_path({4: 104.5, 6: 100.0})   # MFE ~3.9 early, then back to entry
+    SCRIPT.max_cycles = 110                          # runs to the 40-min hold
+elif SC == "early_kill_not_in_profit":
+    SCRIPT.on_cycle = price_path({3: 102.5})         # small MFE (<3) but in profit at 5 min
+    SCRIPT.max_cycles = 160                          # in profit at 40 min -> hold extends to 60
+elif SC == "early_kill_flag_off":
+    B.LIVE_FIX["early_kill"] = False
+    SCRIPT.on_cycle = price_path({3: 99.5})
+    SCRIPT.max_cycles = 110
+elif SC in ("spike_block_bos", "spike_ok_when_efficient"):
+    _ci = B.compute_indicators
+    def _ci2(*a, **k):
+        d = _ci(*a, **k); d["atr"] = 36.0; return d
+    B.compute_indicators = _ci2
+    B.signals.efficiency_ratio = lambda closes: 0.16 if SC == "spike_block_bos" else 0.42
+    SCRIPT.on_cycle = price_path({5: 112})
+elif SC in ("adaptive_startup_from_logs", "adaptive_no_logs_fallback"):
+    if SC == "adaptive_startup_from_logs":           # 12 real paper sessions before 'today'
+        import glob as _g
+        pool = os.environ.get("POOL_DIR", RELEASE)       # on the VM the paper logs sit next to the code
+        days = sorted({re.search(r"(\d{4}-\d{2}-\d{2})", f).group(1)
+                       for f in _g.glob(os.path.join(pool, "scan_v14_*.csv"))})
+        days = [d for d in days if d < "2026-10-15"][-12:]
+        for d in days:
+            for pre in ("scan_v14_", "signals_v14_", "skip_v14_"):
+                src = os.path.join(pool, f"{pre}{d}.csv")
+                if os.path.exists(src): shutil.copy(src, ".")
+    SIGNAL["fire_at"] = set()
+    SCRIPT.max_cycles = 3
 else:
     sys.exit(f"unknown scenario {SC}")
 
@@ -391,6 +428,36 @@ elif SC in ("mock_target", "mock_sl"):
     need(len(rows) == 1 and rows[0]["exit_reason"] == want, f"mock expected 1 {want} exit: {[r['exit_reason'] for r in rows]}")
 elif SC == "backstop_no_bid":
     need(len(rows) == 1 and rows[0]["exit_reason"] == "timeout", f"15:25 backstop did not exit without a bid: {[r['exit_reason'] for r in rows]}")
+
+buys = [o for o in BROKER.orders.values() if o["txn"] == "BUY"]
+if SC == "early_kill_cut":
+    need(len(rows) == 1 and rows[0]["exit_reason"] == "early_kill", f"expected early_kill exit: {[r['exit_reason'] for r in rows]}")
+    need(rows and 4.9 <= rows[0]["duration_min"] <= 5.6, f"cut should happen at ~5 min, got {rows[0]['duration_min'] if rows else None}")
+    need(rows and rows[0]["order_status"] == "filled", "early-kill exit must be a confirmed sell")
+    need(not [o for o in BROKER.orders.values() if o["type"] == "SL-M" and o["status"] == "trigger pending"], "SL-M left resting after early kill")
+    need("EARLY EXIT" in tg_all, "owner not told it was an early exit")
+    need("SL hits today: 0" in tg_all, "early kill must not count as a stop-loss hit")
+elif SC == "early_kill_not_after_mfe":
+    need(len(rows) == 1 and rows[0]["exit_reason"] != "early_kill", f"trade with MFE>=3 was early-killed: {[r['exit_reason'] for r in rows]}")
+    need(rows and rows[0]["duration_min"] > 6, "exited too early")
+elif SC == "early_kill_not_in_profit":
+    need(len(rows) == 1 and rows[0]["exit_reason"] != "early_kill", f"trade in profit was early-killed: {[r['exit_reason'] for r in rows]}")
+elif SC == "early_kill_flag_off":
+    need(len(rows) == 1 and rows[0]["exit_reason"] == "timeout", f"flag off must behave like before (timeout): {[r['exit_reason'] for r in rows]}")
+elif SC == "spike_block_bos":
+    need(not buys, f"BOS traded in a spike with efficiency 0.16 ({len(buys)} buys)")
+    sk = pd.read_csv("live_skip_2026-10-15.csv") if os.path.exists("live_skip_2026-10-15.csv") else pd.DataFrame()
+    need(len(sk) and sk.reasons.str.contains("spike block").any(), "spike skip not written to live_skip log")
+elif SC == "spike_ok_when_efficient":
+    need(len(buys) == 1 and len(rows) == 1 and rows[0]["exit_reason"] == "target", f"efficient high-ATR BOS should trade: buys {len(buys)} rows {[r['exit_reason'] for r in rows]}")
+elif SC == "adaptive_startup_from_logs":
+    need("BOS floor" in tg_all and "ref ATR" in tg_all, f"start message lacks the adaptive floor: {TG[:1]}")
+    need("BOS scorecard" in tg_all, "start message lacks the scorecard line")
+    need(B.signals.ATR_ABS_FLOOR != 18.0, f"floor not set from logs ({B.signals.ATR_ABS_FLOOR})")
+    need(not re.search(r"<[^a-z/]", TG[0] if TG else ""), "start message has a bare '<' that Telegram HTML rejects")
+elif SC == "adaptive_no_logs_fallback":
+    need("fixed floor 18" in tg_all and B.signals.ATR_ABS_FLOOR == 18.0, f"no-logs fallback wrong: floor {B.signals.ATR_ABS_FLOOR}")
+    need("BOS scorecard" in tg_all, "scorecard line missing")
 
 print(("PASS  " if not problems else "FAIL  ") + SC + ("" if not problems else ": " + " | ".join(problems)))
 shutil.rmtree(work, ignore_errors=True)

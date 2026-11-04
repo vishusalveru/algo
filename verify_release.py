@@ -38,10 +38,13 @@ def src(name):
 
 LIVE, PAPER, SIG, EXE, FEEDS = (src("nifty_live_bot.py"), src("nifty_bot_v14.py"), src("signals.py"),
                                 src("live_execution.py"), src("live_feeds_v14.py"))
-record("V0", "Release files are the 2026-10-14 release",
-       'RELEASE = "2026-10-14"' in LIVE and '"seeded_indicators": True' in LIVE
-       and '"fvg_require_in_gap": True' in LIVE and 'MODE = "live"' in LIVE,
-       'RELEASE="2026-10-14", LIVE_FIX seeded+fvg_in_gap True, MODE="live"')
+record("V0", "Release files are the 2026-11-05 release",
+       'RELEASE = "2026-11-05"' in LIVE and '"seeded_indicators": True' in LIVE
+       and '"fvg_require_in_gap": True' in LIVE and '"early_kill": True' in LIVE
+       and '"adaptive_bos": True' in LIVE and '"bos_scorecard": True' in LIVE and 'MODE = "live"' in LIVE
+       and os.path.exists(os.path.join(HERE, "adaptive_gate.py")),
+       'RELEASE="2026-11-05", LIVE_FIX seeded+fvg_in_gap+early_kill+adaptive_bos+bos_scorecard True, '
+       'MODE="live", adaptive_gate.py present')
 
 # ── 4.1 live-money safety: run the fake-broker scenarios ───────────────────
 SAFETY = [
@@ -62,6 +65,12 @@ SAFETY = [
     ("N2", "[no-funds test] rejected entries -> 3 tries -> halt, no sells",
      ["no_funds_rejected_after_place", "no_funds_place_error"]),
     ("N3", "MOCK mode exits at target and at stop", ["mock_target", "mock_sl"]),
+    ("R1", "[2026-11-05] early-kill: cut at 5 min only if MFE<3 and not in profit; switch off = old behaviour",
+     ["early_kill_cut", "early_kill_not_after_mfe", "early_kill_not_in_profit", "early_kill_flag_off"]),
+    ("R2", "[2026-11-05] rule B: spike block (ATR>=35, eff<0.30) skips BOS; efficient spike still trades",
+     ["spike_block_bos", "spike_ok_when_efficient"]),
+    ("R3", "[2026-11-05] BOS floor from paper logs at start-up (fixed 18 without logs) + scorecard line",
+     ["adaptive_startup_from_logs", "adaptive_no_logs_fallback"]),
 ]
 harness = os.path.join(HERE, "tests", "live_harness.py")
 if QUICK:
@@ -243,7 +252,8 @@ record("L5", "Net-GEX comment matches the formula", "dealers are LONG\n    # cal
        "comment corrected; formula unchanged")
 record("L6", "Live writes a skip log for every blocked signal", "live_skip_" in LIVE and LIVE.count("log_live_skip(") >= 5,
        "live_skip_<date>.csv")
-not_in_release("L7", "Telegram OI net-change / concentration line", "visibility feature, not a defect; next release")
+record("L7", "Telegram OI line (paper): totals, change, bias, walls, 5-min change",
+       "def oi_tg_line" in PAPER and "oi_walls" in PAPER, "paper 5-min scan alert")
 
 # ── report ─────────────────────────────────────────────────────────────────
 print("\n" + "=" * 100)

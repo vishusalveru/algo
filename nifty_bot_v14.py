@@ -311,6 +311,8 @@ _oi_tot = {}        # latest totals dict (for TG / signal rows)
 _oi_flip = {}       # {"sign": int, "since": ts}
 _oi_prev_snap = {}  # (strike, side) -> oi at previous snapshot (big-jump detector)
 _oi_big_since_tg = []   # biggest jump since the last 5-min TG line
+_oi_walls = {}      # [2026-11-05] {"ce": (strike, lakh lots), "pe": (...)} — largest OI per side
+_oi_tg_prev = {}    # [2026-11-05] totals + label at the previous Telegram line (5-min change)
 
 def _oi_baseline_file():
     return f"oi_baseline_{now_ist():%Y-%m-%d}.json"
@@ -405,6 +407,18 @@ def compute_oi_totals(chain, now_ts):
         if not _oi_big_since_tg or abs(big[2]) > abs(_oi_big_since_tg[0][1]):
             _oi_big_since_tg[:] = [(txt, big[2])]
     L = lambda q: round(q / OI_LOT_QTY / 1e5, 2)    # quantity -> lakh lots
+    # [2026-11-05] OI walls: strike with the most call OI at/above spot (resistance)
+    # and the most put OI at/below spot (support). Spot = Upstox's
+    # underlying_spot_price on the chain rows; without it, the whole chain is used.
+    _oi_walls.clear()
+    spot = next((_num(r.get("underlying_spot_price")) for r in chain or []
+                 if _num(r.get("underlying_spot_price"))), None)
+    for side in ("ce", "pe"):
+        cand = [(k, oi) for k, s_, oi, _ in rows if s_ == side
+                and (spot is None or (k >= spot if side == "ce" else k <= spot))]
+        best = max(cand, key=lambda x: x[1], default=None)
+        if best and best[1] > 0:
+            _oi_walls[side] = (int(best[0]), L(best[1]))
     out.update({"oi_basis": basis, "oi_basis_since": since, "prev_oi_coverage": round(coverage, 3),
                 "ce_oi_total_lots": L(ce_tot), "pe_oi_total_lots": L(pe_tot),
                 "ce_oi_chg_lots": L(ce_chg), "pe_oi_chg_lots": L(pe_chg),
@@ -426,19 +440,53 @@ def oi_basis_now():
     return _oi_tot.get("oi_basis", "")
 
 def oi_tg_line():
-    """5-min Telegram line in the owner's format. Empty-safe."""
+    """5-min Telegram OI block. [2026-11-05] clearer wording (owner request):
+    label + what it means, totals with change (owner's format), the change since
+    the previous alert, the biggest call/put OI strikes and a unit legend.
+    Display only — the numbers and the label are computed exactly as before."""
     if not _oi_tot or _oi_tot.get("oi_bias", "") == "":
         return "<b>OI</b> n/a (no chain yet)"
     t = _oi_tot
-    basis = "Upstox prev close" if t["oi_basis"] == BASIS_UPSTOX else t["oi_basis_since"]
-    line = (f"<b>OI</b> [{basis}]\n"
-            f"   CE {t['ce_oi_total_lots']:.2f}L ({t['ce_oi_chg_lots']:+.2f}L) | "
-            f"PE {t['pe_oi_total_lots']:.2f}L ({t['pe_oi_chg_lots']:+.2f}L)\n"
-            f"   <b>{t['oi_bias']}</b> (PE−CE {t['oi_net_lots']:+.2f}L, {t['oi_net_pct']:+.1f}%) | PCR {t['pcr_total']}")
+    bias = t["oi_bias"]
+    icon = "🟢" if "BULL" in bias else "🔴" if "BEAR" in bias else "⚪"
+    since = "Upstox prev close" if t["oi_basis"] == BASIS_UPSTOX else t["oi_basis_since"]
+    prev = _oi_tg_prev.get("bias")
+    was = "" if not prev else (" (same as 5 min ago)" if prev == bias else f" (was {prev})")
+    net, pct = t["oi_net_lots"], t["oi_net_pct"]
+    if "BULL" in bias:
+        meaning = f"Put side up {abs(net):.2f}L lots more than call side ({pct:+.1f}% of all OI) → support building"
+    elif "BEAR" in bias:
+        meaning = f"Call side up {abs(net):.2f}L lots more than put side ({pct:+.1f}% of all OI) → resistance building"
+    else:
+        meaning = "Calls and puts changed by the same amount → no side in control"
+    lines = [f"<b>OI</b> {icon} <b>{bias}</b>{was}",
+             f"   CE {t['ce_oi_total_lots']:.2f}L ({t['ce_oi_chg_lots']:+.2f}L) | "
+             f"PE {t['pe_oi_total_lots']:.2f}L ({t['pe_oi_chg_lots']:+.2f}L)  [change since {since}]",
+             f"   {meaning}"]
+    now_ts = time.time()
+    if "ce" in _oi_tg_prev and now_ts > _oi_tg_prev["ts"]:
+        mins = max(1, round((now_ts - _oi_tg_prev["ts"]) / 60))
+        dce = t["ce_oi_total_lots"] - _oi_tg_prev["ce"]; dpe = t["pe_oi_total_lots"] - _oi_tg_prev["pe"]
+        d = dpe - dce
+        tilt = ("puts ahead → bullish tilt" if d > 0.02 else "calls ahead → bearish tilt" if d < -0.02
+                else "balanced")
+        lines.append(f"   Last {mins} min: CE {dce:+.2f}L | PE {dpe:+.2f}L → {tilt}")
+    walls = []
+    if "ce" in _oi_walls:
+        walls.append(f"resistance {_oi_walls['ce'][0]} (CE {_oi_walls['ce'][1]:.2f}L)")
+    if "pe" in _oi_walls:
+        walls.append(f"support {_oi_walls['pe'][0]} (PE {_oi_walls['pe'][1]:.2f}L)")
+    pcr = t.get("pcr_total")
+    pcr_txt = f"PCR {pcr} ({'more puts' if pcr > 1 else 'more calls' if pcr < 1 else 'even'})" if pcr != "" else ""
+    tail = " | ".join(x for x in ("Biggest OI: " + ", ".join(walls) if walls else "", pcr_txt) if x)
+    if tail:
+        lines.append(f"   {tail}")
     if _oi_big_since_tg:
-        line += f"\n   big move: {_oi_big_since_tg[0][0]}"
+        lines.append(f"   big move: {_oi_big_since_tg[0][0]}")
         _oi_big_since_tg.clear()
-    return line
+    lines.append("   <i>L = lakh lots (1 lot = 65 qty)</i>")
+    _oi_tg_prev.update({"ce": t["ce_oi_total_lots"], "pe": t["pe_oi_total_lots"], "bias": bias, "ts": now_ts})
+    return "\n".join(lines)
 
 def fetch_postval_candles(state):
     """END-OF-SESSION (2026-07-18): pull 1-MIN candles for every option contract

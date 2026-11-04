@@ -25,6 +25,7 @@ def chain(strikes, ce, pe, ce_prev=None, pe_prev=None):
     return out
 def reset():
     P._oi_tot.clear(); P._oi_flip.clear(); P._oi_prev_snap.clear(); P._oi_big_since_tg.clear()
+    P._oi_walls.clear(); P._oi_tg_prev.clear()
 K = [22900, 22950, 23000, 23050, 23100]
 LOT = 65; L = lambda lakh_lots: int(lakh_lots * 1e5 * LOT)
 # 1. Upstox basis
@@ -42,7 +43,28 @@ r = P.compute_oi_totals(c2, 1000.0 + 800)
 check(r["oi_bias"] == "STRONG BULL", ">=8% held -> STRONG", f"{r['oi_bias']} {r['oi_net_pct']}")
 line = P.oi_tg_line()
 print("   TG line:", line.replace("\n", " / "))
-check("[Upstox prev close]" in line and "CE 25.00L (+1.00L)" in line and "PE 34.00L (+6.50L)" in line and "STRONG BULL" in line, "Telegram line shows basis, totals, change, label")
+check("change since Upstox prev close" in line and "CE 25.00L (+1.00L)" in line and "PE 34.00L (+6.50L)" in line and "STRONG BULL" in line, "Telegram line shows basis, totals, change, label")
+# [2026-11-05] clarity additions
+check("🟢" in line and "support building" in line and "Put side up 5.50L lots more" in line, "label explained in words (bull)")
+check("PCR 1.36 (more puts)" in line and "lakh lots" in line, "PCR explained + unit legend")
+check("Last" not in line and "was" not in line, "first line: no 5-min change / previous label yet")
+P._oi_tg_prev["ts"] -= 300                  # pretend the previous alert was 5 min ago
+c3 = chain(K, [L(5.2)]*5, [L(6.8)]*5, [L(4.8)]*5, [L(5.5)]*5)          # calls +1.00L, puts unchanged
+P.compute_oi_totals(c3, 1000.0 + 1100)
+line2 = P.oi_tg_line(); print("   TG line 2:", line2.replace("\n", " / "))
+check("Last 5 min: CE +1.00L | PE +0.00L → calls ahead → bearish tilt" in line2, "5-min change shown with tilt", line2)
+check("(was STRONG BULL)" in line2 or "(same as 5 min ago)" in line2, "previous label shown")
+cw = chain(K, [L(5), L(5), L(5), L(9), L(5)], [L(4), L(8), L(6), L(6), L(6)], [L(4.8)]*5, [L(5.5)]*5)
+P.compute_oi_totals(cw, 1000.0 + 1200)
+check("resistance 23050 (CE 9.00L)" in P.oi_tg_line() and P._oi_walls["pe"] == (22950, 8.0), "biggest call/put OI strikes", str(P._oi_walls))
+cw2 = chain(K, [L(9), L(5), L(5), L(6), L(5)], [L(4), L(5), L(6), L(6), L(8)], [L(4.8)]*5, [L(5.5)]*5)
+for r_ in cw2: r_["underlying_spot_price"] = 23010.0
+P.compute_oi_totals(cw2, 1000.0 + 1300)
+check(P._oi_walls == {"ce": (23050, 6.0), "pe": (23000, 6.0)}, "walls only on the correct side of spot (ITM 22900 CE / 23100 PE ignored)", str(P._oi_walls))
+reset(); P.compute_oi_totals(chain(K, [L(5)]*5, [L(5)]*5, [L(6)]*5, [L(6.5)]*5), 1.0)
+lb = P.oi_tg_line()
+check("🔴" in lb and "resistance building" in lb and "Call side up" in lb, "label explained in words (bear)", lb.split("\n")[2])
+check(not __import__("re").search(r"<(?!/?(b|i)>)", lb), "only <b>/<i> tags (Telegram HTML safe)")
 # 2. bot-start basis + persistence across restart
 reset()
 c = chain(K, [L(5)]*5, [L(6)]*5)
